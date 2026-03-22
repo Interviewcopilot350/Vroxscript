@@ -2,7 +2,11 @@ package main
 
 import (
 	"bufio"
+	"crypto/md5"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -12,13 +16,19 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"archive/zip"
+	"io"
+	"path/filepath"
 )
 
-// Default colors — users can override these
+// ============================================================
+// COLORS
+// ============================================================
 var COLORS = map[string]string{
 	"RED":    "\033[91m",
 	"GREEN":  "\033[92m",
@@ -28,124 +38,118 @@ var COLORS = map[string]string{
 	"PURPLE": "\033[95m",
 	"WHITE":  "\033[97m",
 	"BOLD":   "\033[1m",
-	"RESET":  "\033[0m",
 	"DIM":    "\033[2m",
 	"BLINK":  "\033[5m",
+	"RESET":  "\033[0m",
+	"BG_RED":    "\033[41m",
+	"BG_GREEN":  "\033[42m",
+	"BG_YELLOW": "\033[43m",
+	"BG_BLUE":   "\033[44m",
+	"BG_CYAN":   "\033[46m",
 }
 
-const VERSION = "2.0"
+const VERSION = "2.1"
 
 var tlsConfig = &tls.Config{InsecureSkipVerify: true}
 var httpClient = &http.Client{
 	Timeout: 8 * time.Second,
-	Transport: &http.Transport{
-		TLSClientConfig: tlsConfig,
-	},
+	Transport: &http.Transport{TLSClientConfig: tlsConfig},
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	},
 }
 var httpClientFollow = &http.Client{
 	Timeout: 8 * time.Second,
-	Transport: &http.Transport{
-		TLSClientConfig: tlsConfig,
-	},
+	Transport: &http.Transport{TLSClientConfig: tlsConfig},
 }
+
+// Global cookies jar
+var globalCookies = map[string]string{}
+var globalHeaders = map[string]string{}
 
 func vroxError(msg string, lineNum int) {
 	fmt.Println(COLORS["RED"] + "\n[VroxScript Error] Line " + strconv.Itoa(lineNum) + ": " + msg + COLORS["RESET"])
 	fmt.Println(COLORS["YELLOW"] + "-> Fix your .vs file and try again\n" + COLORS["RESET"])
 	os.Exit(1)
 }
-
 func vroxSuccess(msg string) { fmt.Println(COLORS["GREEN"] + msg + COLORS["RESET"]) }
 func vroxInfo(msg string)    { fmt.Println(COLORS["CYAN"] + msg + COLORS["RESET"]) }
 func vroxWarn(msg string)    { fmt.Println(COLORS["YELLOW"] + msg + COLORS["RESET"]) }
 
+// ============================================================
+// STRING HELPERS
+// ============================================================
 func resolveColor(s string, variables map[string]interface{}) string {
-	// Replace color variables like {RED} {GREEN} etc
 	re := regexp.MustCompile(`\{([A-Z_]+)\}`)
-	result := re.ReplaceAllStringFunc(s, func(match string) string {
-		colorName := match[1 : len(match)-1]
-		// Check user defined colors first
-		if v, ok := variables["__color_"+colorName]; ok {
-			return fmt.Sprint(v)
-		}
-		// Then check built in colors
-		if c, ok := COLORS[colorName]; ok {
-			return c
-		}
+	return re.ReplaceAllStringFunc(s, func(match string) string {
+		name := match[1 : len(match)-1]
+		if v, ok := variables["__color_"+name]; ok { return fmt.Sprint(v) }
+		if c, ok := COLORS[name]; ok { return c }
 		return match
 	})
-	return result
-}
-
-func resolveValue(key string, variables map[string]interface{}) string {
-	key = strings.TrimSpace(key)
-	key = strings.Trim(key, "\"")
-	if v, ok := variables[key]; ok {
-		return fmt.Sprint(v)
-	}
-	return key
 }
 
 func interpolateString(s string, variables map[string]interface{}) string {
-	// Handle color codes {RED} {GREEN} etc
 	s = resolveColor(s, variables)
-	// Handle variable interpolation {varname}
 	re := regexp.MustCompile(`\{([^}]+)\}`)
 	return re.ReplaceAllStringFunc(s, func(match string) string {
 		varName := match[1 : len(match)-1]
-		if v, ok := variables[varName]; ok {
-			return fmt.Sprint(v)
-		}
+		if v, ok := variables[varName]; ok { return fmt.Sprint(v) }
 		return match
 	})
+}
+
+func resolveValue(key string, variables map[string]interface{}) string {
+	key = strings.TrimSpace(strings.Trim(key, "\""))
+	if v, ok := variables[key]; ok { return fmt.Sprint(v) }
+	return key
 }
 
 func resolveExpression(expr string, variables map[string]interface{}) string {
 	expr = strings.TrimSpace(expr)
 	if strings.HasPrefix(expr, "\"") && strings.HasSuffix(expr, "\"") {
-		inner := expr[1 : len(expr)-1]
-		return interpolateString(inner, variables)
+		return interpolateString(expr[1:len(expr)-1], variables)
 	}
 	if strings.Contains(expr, " + ") {
 		parts := strings.SplitN(expr, " + ", 2)
 		left := resolveExpression(strings.TrimSpace(parts[0]), variables)
 		right := resolveExpression(strings.TrimSpace(parts[1]), variables)
-		lNum, lErr := strconv.ParseFloat(left, 64)
-		rNum, rErr := strconv.ParseFloat(right, 64)
-		if lErr == nil && rErr == nil {
-			result := lNum + rNum
-			if result == float64(int(result)) {
-				return strconv.Itoa(int(result))
-			}
-			return strconv.FormatFloat(result, 'f', 2, 64)
+		l, le := strconv.ParseFloat(left, 64)
+		r, re2 := strconv.ParseFloat(right, 64)
+		if le == nil && re2 == nil {
+			res := l + r
+			if res == float64(int(res)) { return strconv.Itoa(int(res)) }
+			return strconv.FormatFloat(res, 'f', 2, 64)
 		}
 		return left + right
 	}
-	if v, ok := variables[expr]; ok {
-		return fmt.Sprint(v)
-	}
-	// Check if it's a color variable
-	if c, ok := COLORS[expr]; ok {
-		return c
-	}
+	if v, ok := variables[expr]; ok { return fmt.Sprint(v) }
+	if c, ok := COLORS[expr]; ok { return c }
 	return strings.Trim(expr, "\"")
 }
 
 func evalCondition(condition string, variables map[string]interface{}) bool {
 	condition = strings.TrimSpace(condition)
+	// Handle and/or
+	if strings.Contains(condition, " and ") {
+		parts := strings.SplitN(condition, " and ", 2)
+		return evalCondition(parts[0], variables) && evalCondition(parts[1], variables)
+	}
+	if strings.Contains(condition, " or ") {
+		parts := strings.SplitN(condition, " or ", 2)
+		return evalCondition(parts[0], variables) || evalCondition(parts[1], variables)
+	}
+	if strings.HasPrefix(condition, "not ") {
+		return !evalCondition(condition[4:], variables)
+	}
 	for _, op := range []string{"==", "!=", ">=", "<=", ">", "<"} {
 		if strings.Contains(condition, op) {
 			parts := strings.SplitN(condition, op, 2)
 			left := resolveValue(strings.TrimSpace(parts[0]), variables)
 			right := resolveValue(strings.TrimSpace(parts[1]), variables)
 			switch op {
-			case "==":
-				return left == right
-			case "!=":
-				return left != right
+			case "==": return left == right
+			case "!=": return left != right
 			case ">":
 				l, _ := strconv.ParseFloat(left, 64)
 				r, _ := strconv.ParseFloat(right, 64)
@@ -165,7 +169,12 @@ func evalCondition(condition string, variables map[string]interface{}) bool {
 			}
 		}
 	}
-	return false
+	// Check if variable is truthy
+	if v, ok := variables[condition]; ok {
+		s := fmt.Sprint(v)
+		return s != "" && s != "false" && s != "0" && s != "null"
+	}
+	return condition == "true"
 }
 
 func evalMath(expr string, variables map[string]interface{}) float64 {
@@ -173,51 +182,45 @@ func evalMath(expr string, variables map[string]interface{}) float64 {
 	for k, v := range variables {
 		expr = strings.ReplaceAll(expr, k, fmt.Sprint(v))
 	}
-	if strings.Contains(expr, "+") {
-		parts := strings.SplitN(expr, "+", 2)
-		l, _ := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
-		r, _ := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
-		return l + r
-	}
-	if strings.Contains(expr, "-") {
-		parts := strings.SplitN(expr, "-", 2)
-		l, _ := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
-		r, _ := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
-		return l - r
-	}
-	if strings.Contains(expr, "*") {
-		parts := strings.SplitN(expr, "*", 2)
-		l, _ := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
-		r, _ := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
-		return l * r
-	}
-	if strings.Contains(expr, "/") {
-		parts := strings.SplitN(expr, "/", 2)
-		l, _ := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
-		r, _ := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
-		if r != 0 {
-			return l / r
+	ops := []string{"+", "-", "*", "/", "%"}
+	for _, op := range ops {
+		if strings.Contains(expr, op) {
+			parts := strings.SplitN(expr, op, 2)
+			l, _ := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+			r, _ := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+			switch op {
+			case "+": return l + r
+			case "-": return l - r
+			case "*": return l * r
+			case "/": if r != 0 { return l / r }
+			case "%": return float64(int(l) % int(r))
+			}
 		}
 	}
-	result, _ := strconv.ParseFloat(expr, 64)
-	return result
+	res, _ := strconv.ParseFloat(expr, 64)
+	return res
 }
 
 // ============================================================
 // SECURITY FUNCTIONS
 // ============================================================
-
-func scanSubdomains(domain string) []string {
+func scanSubdomains(domain string, wordlistFile string) []string {
 	wordlist := []string{
-		"www", "mail", "ftp", "api", "dev", "test", "staging", "admin",
-		"blog", "shop", "app", "portal", "dashboard", "secure", "cdn",
-		"static", "media", "images", "login", "auth", "support", "docs",
-		"beta", "old", "new", "v1", "v2", "api2", "mx", "smtp", "pop",
-		"imap", "vpn", "remote", "cloud", "s3", "files", "upload", "git",
-		"jenkins", "jira", "confluence", "gitlab", "prod", "sandbox", "qa",
-		"internal", "intranet", "uat", "mobile", "m", "api3", "beta2",
-		"status", "monitor", "metrics", "grafana", "kibana", "elastic",
-		"redis", "mysql", "postgres", "mongo", "backup", "archive",
+		"www","mail","ftp","api","dev","test","staging","admin","blog","shop",
+		"app","portal","dashboard","secure","cdn","static","media","images",
+		"login","auth","support","docs","beta","old","new","v1","v2","api2",
+		"mx","smtp","pop","imap","vpn","remote","cloud","s3","files","upload",
+		"git","jenkins","jira","confluence","gitlab","prod","sandbox","qa",
+		"internal","intranet","uat","mobile","m","api3","status","monitor",
+		"metrics","grafana","kibana","elastic","redis","mysql","postgres",
+		"mongo","backup","archive","pay","payment","checkout","store","shop2",
+	}
+	if wordlistFile != "" {
+		data, err := os.ReadFile(wordlistFile)
+		if err == nil {
+			wordlist = strings.Split(strings.TrimSpace(string(data)), "\n")
+			vroxInfo("[scan] Using custom wordlist: " + strconv.Itoa(len(wordlist)) + " entries")
+		}
 	}
 	found := []string{}
 	var mu sync.Mutex
@@ -248,10 +251,12 @@ func checkAlive(hosts []string) []string {
 		wg.Add(1)
 		go func(h string) {
 			defer wg.Done()
+			start := time.Now()
 			resp, err := httpClientFollow.Get("https://" + h)
+			elapsed := time.Since(start).Milliseconds()
 			if err == nil {
 				defer resp.Body.Close()
-				result := h + " -> " + strconv.Itoa(resp.StatusCode)
+				result := h + " -> " + strconv.Itoa(resp.StatusCode) + " (" + strconv.FormatInt(elapsed, 10) + "ms)"
 				mu.Lock()
 				alive = append(alive, result)
 				fmt.Println(COLORS["GREEN"] + "[alive] " + result + COLORS["RESET"])
@@ -265,9 +270,17 @@ func checkAlive(hosts []string) []string {
 	return alive
 }
 
-func scanPorts(host string) []int {
-	ports := []int{21, 22, 23, 25, 53, 80, 443, 445, 3306, 3389, 8080, 8443, 8888, 9200, 6379, 27017, 5432, 1433, 9300, 4443}
-	open := []int{}
+func scanPorts(host string, customPorts []int) []string {
+	ports := []int{21,22,23,25,53,80,443,445,3306,3389,8080,8443,8888,9200,6379,27017,5432,1433,9300,4443}
+	if len(customPorts) > 0 { ports = customPorts }
+	portNames := map[int]string{
+		21:"FTP",22:"SSH",23:"Telnet",25:"SMTP",53:"DNS",
+		80:"HTTP",443:"HTTPS",445:"SMB",3306:"MySQL",
+		3389:"RDP",8080:"HTTP-Alt",8443:"HTTPS-Alt",
+		8888:"HTTP-Alt",9200:"Elasticsearch",6379:"Redis",
+		27017:"MongoDB",5432:"PostgreSQL",1433:"MSSQL",
+	}
+	open := []string{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, port := range ports {
@@ -277,9 +290,14 @@ func scanPorts(host string) []int {
 			conn, err := net.DialTimeout("tcp", host+":"+strconv.Itoa(p), 1*time.Second)
 			if err == nil {
 				conn.Close()
+				name := portNames[p]
+				if name == "" { name = "Unknown" }
+				result := strconv.Itoa(p) + "/" + name
 				mu.Lock()
-				open = append(open, p)
-				fmt.Println(COLORS["GREEN"] + "[ports] " + host + ":" + strconv.Itoa(p) + " -> open" + COLORS["RESET"])
+				open = append(open, result)
+				color := COLORS["GREEN"]
+				if p == 22 || p == 3389 || p == 3306 || p == 27017 { color = COLORS["RED"] }
+				fmt.Println(color + "[ports] " + host + ":" + result + " -> open" + COLORS["RESET"])
 				mu.Unlock()
 			}
 		}(port)
@@ -290,12 +308,17 @@ func scanPorts(host string) []int {
 
 func grabHeaders(targetURL string) map[string]string {
 	headers := map[string]string{}
-	resp, err := httpClientFollow.Get(targetURL)
+	req, _ := http.NewRequest("GET", targetURL, nil)
+	for k, v := range globalHeaders { req.Header.Set(k, v) }
+	for k, v := range globalCookies { req.AddCookie(&http.Cookie{Name: k, Value: v}) }
+	resp, err := httpClientFollow.Do(req)
 	if err != nil {
 		fmt.Println(COLORS["RED"] + "[headers] Failed: " + err.Error() + COLORS["RESET"])
 		return headers
 	}
 	defer resp.Body.Close()
+	// Save cookies
+	for _, c := range resp.Cookies() { globalCookies[c.Name] = c.Value }
 	for k, v := range resp.Header {
 		headers[k] = strings.Join(v, ", ")
 		fmt.Println(COLORS["CYAN"] + "[header] " + k + ": " + strings.Join(v, ", ") + COLORS["RESET"])
@@ -319,10 +342,7 @@ func checkSecHeaders(targetURL string) ([]string, []string) {
 	for header, name := range important {
 		found := false
 		for k := range headers {
-			if strings.EqualFold(k, header) {
-				found = true
-				break
-			}
+			if strings.EqualFold(k, header) { found = true; break }
 		}
 		if found {
 			present = append(present, name)
@@ -349,9 +369,7 @@ func dnsLookup(domain string) map[string]string {
 	}
 	mxs, err := net.LookupMX(domain)
 	if err == nil {
-		for _, mx := range mxs {
-			fmt.Println(COLORS["CYAN"] + "[dns] MX: " + mx.Host + COLORS["RESET"])
-		}
+		for _, mx := range mxs { fmt.Println(COLORS["CYAN"] + "[dns] MX: " + mx.Host + COLORS["RESET"]) }
 	}
 	txts, err := net.LookupTXT(domain)
 	if err == nil {
@@ -362,49 +380,32 @@ func dnsLookup(domain string) map[string]string {
 	}
 	nss, err := net.LookupNS(domain)
 	if err == nil {
-		for _, ns := range nss {
-			fmt.Println(COLORS["CYAN"] + "[dns] NS: " + ns.Host + COLORS["RESET"])
-		}
+		for _, ns := range nss { fmt.Println(COLORS["CYAN"] + "[dns] NS: " + ns.Host + COLORS["RESET"]) }
 	}
 	return records
 }
 
 func fetchPage(targetURL string) (int, string, map[string]string) {
-	resp, err := httpClientFollow.Get(targetURL)
+	req, err := http.NewRequest("GET", targetURL, nil)
+	if err != nil { return 0, "", map[string]string{} }
+	for k, v := range globalHeaders { req.Header.Set(k, v) }
+	for k, v := range globalCookies { req.AddCookie(&http.Cookie{Name: k, Value: v}) }
+	start := time.Now()
+	resp, err := httpClientFollow.Do(req)
+	elapsed := time.Since(start).Milliseconds()
 	if err != nil {
 		fmt.Println(COLORS["RED"] + "[fetch] " + targetURL + " -> failed" + COLORS["RESET"])
 		return 0, "", map[string]string{}
 	}
 	defer resp.Body.Close()
+	for _, c := range resp.Cookies() { globalCookies[c.Name] = c.Value }
 	buf := make([]byte, 10000)
 	n, _ := resp.Body.Read(buf)
 	body := string(buf[:n])
 	headers := map[string]string{}
-	for k, v := range resp.Header {
-		headers[k] = strings.Join(v, ", ")
-	}
-	fmt.Println(COLORS["GREEN"] + "[fetch] " + targetURL + " -> " + strconv.Itoa(resp.StatusCode) + COLORS["RESET"])
+	for k, v := range resp.Header { headers[k] = strings.Join(v, ", ") }
+	fmt.Println(COLORS["GREEN"] + "[fetch] " + targetURL + " -> " + strconv.Itoa(resp.StatusCode) + " (" + strconv.FormatInt(elapsed, 10) + "ms)" + COLORS["RESET"])
 	return resp.StatusCode, body, headers
-}
-
-func fetchWithHeaders(targetURL string, customHeaders map[string]string) (int, string) {
-	req, err := http.NewRequest("GET", targetURL, nil)
-	if err != nil {
-		return 0, ""
-	}
-	for k, v := range customHeaders {
-		req.Header.Set(k, v)
-	}
-	resp, err := httpClientFollow.Do(req)
-	if err != nil {
-		fmt.Println(COLORS["RED"] + "[fetch] Failed: " + err.Error() + COLORS["RESET"])
-		return 0, ""
-	}
-	defer resp.Body.Close()
-	buf := make([]byte, 10000)
-	n, _ := resp.Body.Read(buf)
-	fmt.Println(COLORS["GREEN"] + "[fetch] " + targetURL + " -> " + strconv.Itoa(resp.StatusCode) + COLORS["RESET"])
-	return resp.StatusCode, string(buf[:n])
 }
 
 func crawlLinks(targetURL string) []string {
@@ -412,8 +413,7 @@ func crawlLinks(targetURL string) []string {
 	links := []string{}
 	seen := map[string]bool{}
 	re := regexp.MustCompile(`href="(https?://[^"]+)"`)
-	matches := re.FindAllStringSubmatch(body, -1)
-	for _, m := range matches {
+	for _, m := range re.FindAllStringSubmatch(body, -1) {
 		if !seen[m[1]] {
 			seen[m[1]] = true
 			links = append(links, m[1])
@@ -430,27 +430,17 @@ func extractJSUrls(targetURL string) []string {
 	re1 := regexp.MustCompile(`["'](/[a-zA-Z0-9/_\-.]+)["']`)
 	re2 := regexp.MustCompile(`src=["']([^"']+\.js)["']`)
 	for _, m := range re1.FindAllStringSubmatch(body, -1) {
-		if !seen[m[1]] {
-			seen[m[1]] = true
-			results = append(results, m[1])
-			fmt.Println(COLORS["CYAN"] + "[js] " + m[1] + COLORS["RESET"])
-		}
+		if !seen[m[1]] { seen[m[1]] = true; results = append(results, m[1]); fmt.Println(COLORS["CYAN"] + "[js] " + m[1] + COLORS["RESET"]) }
 	}
 	for _, m := range re2.FindAllStringSubmatch(body, -1) {
-		if !seen[m[1]] {
-			seen[m[1]] = true
-			results = append(results, m[1])
-			fmt.Println(COLORS["CYAN"] + "[js] " + m[1] + COLORS["RESET"])
-		}
+		if !seen[m[1]] { seen[m[1]] = true; results = append(results, m[1]); fmt.Println(COLORS["CYAN"] + "[js] " + m[1] + COLORS["RESET"]) }
 	}
 	return results
 }
 
 func extractParams(rawURL string) []string {
 	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return []string{}
-	}
+	if err != nil { return []string{} }
 	results := []string{}
 	for k, v := range parsed.Query() {
 		result := k + "=" + strings.Join(v, ",")
@@ -463,10 +453,7 @@ func extractParams(rawURL string) []string {
 func waybackLookup(domain string) []string {
 	apiURL := "http://web.archive.org/cdx/search/cdx?url=" + domain + "/*&output=json&limit=30&fl=original"
 	resp, err := httpClientFollow.Get(apiURL)
-	if err != nil {
-		fmt.Println(COLORS["RED"] + "[wayback] Failed: " + err.Error() + COLORS["RESET"])
-		return []string{}
-	}
+	if err != nil { fmt.Println(COLORS["RED"] + "[wayback] Failed" + COLORS["RESET"]); return []string{} }
 	defer resp.Body.Close()
 	var data [][]string
 	json.NewDecoder(resp.Body).Decode(&data)
@@ -480,17 +467,23 @@ func waybackLookup(domain string) []string {
 	return results
 }
 
-func fuzzDirs(targetURL string) []string {
+func fuzzDirs(targetURL string, wordlistFile string) []string {
 	wordlist := []string{
-		"admin", "login", "dashboard", "api", "v1", "v2", "v3", "config",
-		"backup", "test", "dev", "staging", "upload", "files", "static",
-		"assets", "images", "js", "css", "includes", "wp-admin",
-		"administrator", "manager", "panel", "secret", "private",
-		"internal", "debug", "console", ".git", ".env", "robots.txt",
-		"sitemap.xml", "security.txt", ".well-known", "phpinfo.php",
-		"server-status", "api/v1", "api/v2", "api/v3", "graphql",
-		"swagger", "swagger-ui", "api-docs", "actuator", "metrics",
-		"health", "status", "info", "env", "trace", "dump",
+		"admin","login","dashboard","api","v1","v2","v3","config","backup",
+		"test","dev","staging","upload","files","static","assets","images",
+		"js","css","includes","wp-admin","administrator","manager","panel",
+		"secret","private","internal","debug","console",".git",".env",
+		"robots.txt","sitemap.xml","security.txt",".well-known","phpinfo.php",
+		"server-status","api/v1","api/v2","api/v3","graphql","swagger",
+		"swagger-ui","api-docs","actuator","metrics","health","status",
+		"info","env","trace","dump","phpmyadmin","adminer","wp-login.php",
+	}
+	if wordlistFile != "" {
+		data, err := os.ReadFile(wordlistFile)
+		if err == nil {
+			wordlist = strings.Split(strings.TrimSpace(string(data)), "\n")
+			vroxInfo("[fuzz] Using custom wordlist: " + strconv.Itoa(len(wordlist)) + " entries")
+		}
 	}
 	found := []string{}
 	var mu sync.Mutex
@@ -530,9 +523,11 @@ func grepSecrets(content string) map[string][]string {
 		"AWS Key":      `AKIA[0-9A-Z]{16}`,
 		"Private Key":  `-----BEGIN (RSA |EC )?PRIVATE KEY-----`,
 		"Email":        `[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`,
-		"JWT Token":    `eyJ[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+`,
+		"JWT":          `eyJ[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+`,
 		"Google API":   `AIza[0-9A-Za-z\-_]{35}`,
 		"GitHub Token": `ghp_[a-zA-Z0-9]{36}`,
+		"Slack Token":  `xox[baprs]-[0-9a-zA-Z\-]+`,
+		"Discord":      `[MN][A-Za-z\d]{23}\.[\w-]{6}\.[\w-]{27}`,
 	}
 	found := map[string][]string{}
 	for name, pattern := range patterns {
@@ -547,24 +542,14 @@ func grepSecrets(content string) map[string][]string {
 }
 
 func checkSubdomainTakeover(domain string, subdomains []string) []string {
-	vulnerable := []string{}
 	cnames := map[string]string{
-		"amazonaws.com":     "AWS S3",
-		"github.io":         "GitHub Pages",
-		"herokuapp.com":     "Heroku",
-		"azurewebsites.net": "Azure",
-		"cloudapp.net":      "Azure",
-		"ghost.io":          "Ghost",
-		"myshopify.com":     "Shopify",
-		"webflow.io":        "Webflow",
-		"netlify.app":       "Netlify",
-		"vercel.app":        "Vercel",
-		"surge.sh":          "Surge",
-		"bitbucket.io":      "Bitbucket",
-		"pantheonsite.io":   "Pantheon",
-		"freshdesk.com":     "Freshdesk",
-		"zendesk.com":       "Zendesk",
+		"amazonaws.com":"AWS S3","github.io":"GitHub Pages",
+		"herokuapp.com":"Heroku","azurewebsites.net":"Azure",
+		"ghost.io":"Ghost","myshopify.com":"Shopify",
+		"webflow.io":"Webflow","netlify.app":"Netlify",
+		"vercel.app":"Vercel","surge.sh":"Surge",
 	}
+	vulnerable := []string{}
 	vroxInfo("[takeover] Checking " + strconv.Itoa(len(subdomains)) + " subdomains...")
 	for _, sub := range subdomains {
 		cname, err := net.LookupCNAME(sub)
@@ -581,9 +566,7 @@ func checkSubdomainTakeover(domain string, subdomains []string) []string {
 			}
 		}
 	}
-	if len(vulnerable) == 0 {
-		vroxSuccess("[takeover] No subdomain takeover found")
-	}
+	if len(vulnerable) == 0 { vroxSuccess("[takeover] No subdomain takeover found") }
 	return vulnerable
 }
 
@@ -593,55 +576,48 @@ func checkCORS(targetURL string) map[string]string {
 	vroxInfo("[cors] Testing CORS misconfigurations...")
 	for _, origin := range origins {
 		req, err := http.NewRequest("GET", targetURL, nil)
-		if err != nil {
-			continue
-		}
+		if err != nil { continue }
 		req.Header.Set("Origin", origin)
 		resp, err := httpClientFollow.Do(req)
-		if err != nil {
-			continue
-		}
+		if err != nil { continue }
 		defer resp.Body.Close()
 		acao := resp.Header.Get("Access-Control-Allow-Origin")
 		acac := resp.Header.Get("Access-Control-Allow-Credentials")
 		if acao == "*" {
-			fmt.Println(COLORS["RED"] + "[cors] VULNERABLE: Wildcard origin allowed" + COLORS["RESET"])
-			results["wildcard"] = "Access-Control-Allow-Origin: *"
+			fmt.Println(COLORS["RED"] + "[cors] VULNERABLE: Wildcard" + COLORS["RESET"])
+			results["wildcard"] = "*"
 		} else if acao == origin {
-			fmt.Println(COLORS["RED"] + "[cors] VULNERABLE: Origin reflected: " + origin + COLORS["RESET"])
+			fmt.Println(COLORS["RED"] + "[cors] VULNERABLE: Reflected " + origin + COLORS["RESET"])
 			results[origin] = "Reflected"
 			if acac == "true" {
 				fmt.Println(COLORS["RED"] + "[cors] CRITICAL: Credentials allowed!" + COLORS["RESET"])
 				results["credentials"] = "true"
 			}
 		} else {
-			fmt.Println(COLORS["GREEN"] + "[cors] Origin " + origin + " -> safe" + COLORS["RESET"])
+			fmt.Println(COLORS["GREEN"] + "[cors] " + origin + " -> safe" + COLORS["RESET"])
 		}
 	}
-	if len(results) == 0 {
-		vroxSuccess("[cors] No CORS issues found")
-	}
+	if len(results) == 0 { vroxSuccess("[cors] No CORS issues found") }
 	return results
 }
 
 func checkSSL(targetURL string) map[string]string {
 	results := map[string]string{}
-	host := strings.Replace(targetURL, "https://", "", 1)
-	host = strings.Replace(host, "http://", "", 1)
+	host := strings.Replace(strings.Replace(targetURL, "https://", "", 1), "http://", "", 1)
 	host = strings.Split(host, "/")[0]
-	vroxInfo("[ssl] Checking SSL certificate for " + host + "...")
+	vroxInfo("[ssl] Checking " + host + "...")
 	conn, err := tls.Dial("tcp", host+":443", &tls.Config{InsecureSkipVerify: false})
 	if err != nil {
-		fmt.Println(COLORS["RED"] + "[ssl] Certificate error: " + err.Error() + COLORS["RESET"])
+		fmt.Println(COLORS["RED"] + "[ssl] Error: " + err.Error() + COLORS["RESET"])
 		results["error"] = err.Error()
 		return results
 	}
 	defer conn.Close()
 	cert := conn.ConnectionState().PeerCertificates[0]
+	daysLeft := int(time.Until(cert.NotAfter).Hours() / 24)
 	results["subject"] = cert.Subject.CommonName
 	results["issuer"] = cert.Issuer.CommonName
 	results["expires"] = cert.NotAfter.Format("2006-01-02")
-	daysLeft := int(time.Until(cert.NotAfter).Hours() / 24)
 	results["days_left"] = strconv.Itoa(daysLeft)
 	fmt.Println(COLORS["CYAN"] + "[ssl] Subject: " + cert.Subject.CommonName + COLORS["RESET"])
 	fmt.Println(COLORS["CYAN"] + "[ssl] Issuer: " + cert.Issuer.CommonName + COLORS["RESET"])
@@ -656,29 +632,20 @@ func checkSSL(targetURL string) map[string]string {
 
 func detectTech(targetURL string) []string {
 	_, body, headers := fetchPage(targetURL)
-	technologies := []string{}
 	patterns := map[string]string{
-		"WordPress":        `wp-content|wp-includes|WordPress`,
-		"jQuery":           `jquery`,
-		"React":            `react|React`,
-		"Angular":          `angular|ng-version`,
-		"Vue.js":           `vue|Vue`,
-		"Bootstrap":        `bootstrap`,
-		"Laravel":          `laravel`,
-		"Django":           `django|csrftoken`,
-		"Rails":            `rails|_session`,
-		"ASP.NET":          `aspnet|__VIEWSTATE`,
-		"PHP":              `\.php|X-Powered-By: PHP`,
-		"Nginx":            `nginx`,
-		"Apache":           `apache|Apache`,
-		"Cloudflare":       `cloudflare|__cfduid`,
-		"AWS":              `amazonaws|aws`,
-		"Google Analytics": `google-analytics|gtag`,
-		"Next.js":          `__NEXT_DATA__|next`,
-		"Nuxt.js":          `__NUXT__|nuxt`,
+		"WordPress":"wp-content|wp-includes","jQuery":"jquery",
+		"React":"react|__REACT","Angular":"angular|ng-version",
+		"Vue.js":"vue|__VUE","Bootstrap":"bootstrap",
+		"Laravel":"laravel","Django":"django|csrftoken",
+		"Rails":"rails","ASP.NET":"aspnet|__VIEWSTATE",
+		"PHP":"\\.php","Nginx":"nginx","Apache":"apache",
+		"Cloudflare":"cloudflare","Next.js":"__NEXT_DATA__",
+		"Nuxt.js":"__NUXT__","Gatsby":"gatsby",
+		"Express":"express","Spring":"spring",
 	}
-	vroxInfo("[techdetect] Detecting technologies...")
+	technologies := []string{}
 	seen := map[string]bool{}
+	vroxInfo("[techdetect] Detecting technologies...")
 	for tech, pattern := range patterns {
 		re := regexp.MustCompile(`(?i)` + pattern)
 		if re.MatchString(body) && !seen[tech] {
@@ -702,10 +669,9 @@ func detectTech(targetURL string) []string {
 func extractEmails(targetURL string) []string {
 	_, body, _ := fetchPage(targetURL)
 	re := regexp.MustCompile(`[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`)
-	matches := re.FindAllString(body, -1)
 	seen := map[string]bool{}
 	results := []string{}
-	for _, m := range matches {
+	for _, m := range re.FindAllString(body, -1) {
 		if !seen[m] {
 			seen[m] = true
 			results = append(results, m)
@@ -718,10 +684,7 @@ func extractEmails(targetURL string) []string {
 func whoisLookup(domain string) string {
 	vroxInfo("[whois] Looking up " + domain + "...")
 	resp, err := httpClientFollow.Get("https://api.whoisjson.com/v1/" + domain)
-	if err != nil {
-		fmt.Println(COLORS["RED"] + "[whois] Failed: " + err.Error() + COLORS["RESET"])
-		return ""
-	}
+	if err != nil { fmt.Println(COLORS["RED"] + "[whois] Failed" + COLORS["RESET"]); return "" }
 	defer resp.Body.Close()
 	buf := make([]byte, 5000)
 	n, _ := resp.Body.Read(buf)
@@ -736,20 +699,17 @@ func checkRateLimit(targetURL string) map[string]string {
 	codes := map[int]int{}
 	for i := 0; i < 20; i++ {
 		resp, err := httpClientFollow.Get(targetURL)
-		if err == nil {
-			codes[resp.StatusCode]++
-			resp.Body.Close()
-		}
+		if err == nil { codes[resp.StatusCode]++; resp.Body.Close() }
 		time.Sleep(100 * time.Millisecond)
 	}
 	if codes[429] > 0 {
-		fmt.Println(COLORS["GREEN"] + "[ratelimit] Rate limiting enforced" + COLORS["RESET"])
+		vroxSuccess("[ratelimit] Rate limiting enforced")
 		results["status"] = "protected"
 	} else if codes[200] == 20 {
-		fmt.Println(COLORS["RED"] + "[ratelimit] No rate limiting detected!" + COLORS["RESET"])
+		fmt.Println(COLORS["RED"] + "[ratelimit] No rate limiting!" + COLORS["RESET"])
 		results["status"] = "vulnerable"
 	} else {
-		fmt.Println(COLORS["YELLOW"] + "[ratelimit] Inconclusive" + COLORS["RESET"])
+		vroxWarn("[ratelimit] Inconclusive")
 		results["status"] = "inconclusive"
 	}
 	return results
@@ -757,13 +717,11 @@ func checkRateLimit(targetURL string) map[string]string {
 
 func checkOpenRedirect(targetURL string) []string {
 	payloads := []string{"//evil.com", "https://evil.com", "/\\evil.com"}
-	params := []string{"url", "redirect", "next", "return", "goto", "dest", "redir", "redirect_uri", "return_url"}
+	params := []string{"url","redirect","next","return","goto","dest","redir","redirect_uri","return_url"}
 	vulnerable := []string{}
-	vroxInfo("[openredirect] Testing open redirect...")
+	vroxInfo("[openredirect] Testing...")
 	parsed, err := url.Parse(targetURL)
-	if err != nil {
-		return vulnerable
-	}
+	if err != nil { return vulnerable }
 	for _, param := range params {
 		for _, payload := range payloads {
 			testURL := parsed.Scheme + "://" + parsed.Host + parsed.Path + "?" + param + "=" + url.QueryEscape(payload)
@@ -775,27 +733,23 @@ func checkOpenRedirect(targetURL string) []string {
 					if strings.Contains(location, "evil.com") {
 						result := param + "=" + payload + " -> VULNERABLE"
 						vulnerable = append(vulnerable, result)
-						fmt.Println(COLORS["RED"] + "[openredirect] VULNERABLE: " + result + COLORS["RESET"])
+						fmt.Println(COLORS["RED"] + "[openredirect] " + result + COLORS["RESET"])
 					}
 				}
 			}
 		}
 	}
-	if len(vulnerable) == 0 {
-		vroxSuccess("[openredirect] No open redirect found")
-	}
+	if len(vulnerable) == 0 { vroxSuccess("[openredirect] No open redirect found") }
 	return vulnerable
 }
 
 func checkSQLi(targetURL string, param string) []string {
-	payloads := []string{"'", "''", "' OR '1'='1", "' OR 1=1--", "\" OR 1=1--"}
-	errors := []string{"sql syntax", "mysql_fetch", "ora-", "sqlite_", "warning: mysql", "you have an error in your sql", "sqlstate", "syntax error"}
+	payloads := []string{"'","''","' OR '1'='1","' OR 1=1--","\" OR 1=1--","1' ORDER BY 1--"}
+	errors := []string{"sql syntax","mysql_fetch","ora-","sqlite_","warning: mysql","you have an error in your sql","sqlstate","syntax error"}
 	vulnerable := []string{}
-	vroxInfo("[sqli] Testing SQL injection on param: " + param + "...")
+	vroxInfo("[sqli] Testing param: " + param + "...")
 	parsed, err := url.Parse(targetURL)
-	if err != nil {
-		return vulnerable
-	}
+	if err != nil { return vulnerable }
 	for _, payload := range payloads {
 		testURL := parsed.Scheme + "://" + parsed.Host + parsed.Path + "?" + param + "=" + url.QueryEscape(payload)
 		resp, err := httpClientFollow.Get(testURL)
@@ -814,9 +768,7 @@ func checkSQLi(targetURL string, param string) []string {
 			}
 		}
 	}
-	if len(vulnerable) == 0 {
-		vroxSuccess("[sqli] No SQL injection errors found")
-	}
+	if len(vulnerable) == 0 { vroxSuccess("[sqli] No SQL errors found") }
 	return vulnerable
 }
 
@@ -825,13 +777,13 @@ func checkXSS(targetURL string, param string) []string {
 		"<script>alert(1)</script>",
 		"<img src=x onerror=alert(1)>",
 		"<svg onload=alert(1)>",
+		"javascript:alert(1)",
+		"'><script>alert(1)</script>",
 	}
 	vulnerable := []string{}
-	vroxInfo("[xss] Testing XSS on param: " + param + "...")
+	vroxInfo("[xss] Testing param: " + param + "...")
 	parsed, err := url.Parse(targetURL)
-	if err != nil {
-		return vulnerable
-	}
+	if err != nil { return vulnerable }
 	for _, payload := range payloads {
 		testURL := parsed.Scheme + "://" + parsed.Host + parsed.Path + "?" + param + "=" + url.QueryEscape(payload)
 		resp, err := httpClientFollow.Get(testURL)
@@ -839,30 +791,186 @@ func checkXSS(targetURL string, param string) []string {
 			defer resp.Body.Close()
 			buf := make([]byte, 5000)
 			n, _ := resp.Body.Read(buf)
-			body := string(buf[:n])
-			if strings.Contains(body, payload) {
+			if strings.Contains(string(buf[:n]), payload) {
 				result := param + "=" + payload + " -> REFLECTED"
 				vulnerable = append(vulnerable, result)
 				fmt.Println(COLORS["RED"] + "[xss] POSSIBLE: " + result + COLORS["RESET"])
 			}
 		}
 	}
-	if len(vulnerable) == 0 {
-		vroxSuccess("[xss] No XSS reflection found")
-	}
+	if len(vulnerable) == 0 { vroxSuccess("[xss] No XSS reflection found") }
 	return vulnerable
+}
+
+func checkSSRF(targetURL string, param string) []string {
+	payloads := []string{
+		"http://169.254.169.254/latest/meta-data/",
+		"http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+		"http://localhost/",
+		"http://127.0.0.1/",
+		"http://0.0.0.0/",
+		"http://[::1]/",
+	}
+	vulnerable := []string{}
+	vroxInfo("[ssrf] Testing param: " + param + "...")
+	parsed, err := url.Parse(targetURL)
+	if err != nil { return vulnerable }
+	for _, payload := range payloads {
+		testURL := parsed.Scheme + "://" + parsed.Host + parsed.Path + "?" + param + "=" + url.QueryEscape(payload)
+		resp, err := httpClientFollow.Get(testURL)
+		if err == nil {
+			defer resp.Body.Close()
+			buf := make([]byte, 1000)
+			n, _ := resp.Body.Read(buf)
+			body := string(buf[:n])
+			if strings.Contains(body, "ami-id") || strings.Contains(body, "instance-id") || strings.Contains(body, "root:") {
+				result := param + "=" + payload + " -> VULNERABLE (internal access)"
+				vulnerable = append(vulnerable, result)
+				fmt.Println(COLORS["RED"] + "[ssrf] VULNERABLE: " + result + COLORS["RESET"])
+			} else if resp.StatusCode == 200 {
+				result := param + "=" + payload + " -> possible (" + strconv.Itoa(resp.StatusCode) + ")"
+				fmt.Println(COLORS["YELLOW"] + "[ssrf] Check manually: " + result + COLORS["RESET"])
+			}
+		}
+	}
+	if len(vulnerable) == 0 { vroxSuccess("[ssrf] No obvious SSRF found") }
+	return vulnerable
+}
+
+func checkLFI(targetURL string, param string) []string {
+	payloads := []string{
+		"../etc/passwd",
+		"../../etc/passwd",
+		"../../../etc/passwd",
+		"....//....//etc/passwd",
+		"/etc/passwd",
+		"..%2F..%2Fetc%2Fpasswd",
+		"..%252F..%252Fetc%252Fpasswd",
+	}
+	vulnerable := []string{}
+	vroxInfo("[lfi] Testing param: " + param + "...")
+	parsed, err := url.Parse(targetURL)
+	if err != nil { return vulnerable }
+	for _, payload := range payloads {
+		testURL := parsed.Scheme + "://" + parsed.Host + parsed.Path + "?" + param + "=" + payload
+		resp, err := httpClientFollow.Get(testURL)
+		if err == nil {
+			defer resp.Body.Close()
+			buf := make([]byte, 2000)
+			n, _ := resp.Body.Read(buf)
+			body := string(buf[:n])
+			if strings.Contains(body, "root:") || strings.Contains(body, "bin:") || strings.Contains(body, "daemon:") {
+				result := param + "=" + payload + " -> VULNERABLE (file read)"
+				vulnerable = append(vulnerable, result)
+				fmt.Println(COLORS["RED"] + "[lfi] VULNERABLE: " + result + COLORS["RESET"])
+			}
+		}
+	}
+	if len(vulnerable) == 0 { vroxSuccess("[lfi] No LFI found") }
+	return vulnerable
+}
+
+func checkCRLF(targetURL string) []string {
+	payloads := []string{
+		"%0d%0aHeader:injected",
+		"%0aHeader:injected",
+		"%0d%0aSet-Cookie:injected=1",
+		"\r\nHeader:injected",
+	}
+	vulnerable := []string{}
+	vroxInfo("[crlf] Testing CRLF injection...")
+	for _, payload := range payloads {
+		testURL := targetURL + "?" + payload
+		resp, err := httpClient.Get(testURL)
+		if err == nil {
+			defer resp.Body.Close()
+			for k := range resp.Header {
+				if strings.ToLower(k) == "header" || strings.Contains(strings.ToLower(k), "injected") {
+					result := payload + " -> VULNERABLE"
+					vulnerable = append(vulnerable, result)
+					fmt.Println(COLORS["RED"] + "[crlf] VULNERABLE: " + result + COLORS["RESET"])
+					break
+				}
+			}
+		}
+	}
+	if len(vulnerable) == 0 { vroxSuccess("[crlf] No CRLF injection found") }
+	return vulnerable
+}
+
+func checkSSTI(targetURL string, param string) []string {
+	payloads := []string{"{{7*7}}", "${7*7}", "<%= 7*7 %>", "#{7*7}", "*{7*7}"}
+	vulnerable := []string{}
+	vroxInfo("[ssti] Testing param: " + param + "...")
+	parsed, err := url.Parse(targetURL)
+	if err != nil { return vulnerable }
+	for _, payload := range payloads {
+		testURL := parsed.Scheme + "://" + parsed.Host + parsed.Path + "?" + param + "=" + url.QueryEscape(payload)
+		resp, err := httpClientFollow.Get(testURL)
+		if err == nil {
+			defer resp.Body.Close()
+			buf := make([]byte, 2000)
+			n, _ := resp.Body.Read(buf)
+			body := string(buf[:n])
+			if strings.Contains(body, "49") {
+				result := param + "=" + payload + " -> VULNERABLE (7*7=49 executed)"
+				vulnerable = append(vulnerable, result)
+				fmt.Println(COLORS["RED"] + "[ssti] VULNERABLE: " + result + COLORS["RESET"])
+			}
+		}
+	}
+	if len(vulnerable) == 0 { vroxSuccess("[ssti] No SSTI found") }
+	return vulnerable
+}
+
+func measureResponseTime(targetURL string, count int) map[string]string {
+	results := map[string]string{}
+	vroxInfo("[timing] Measuring response time (" + strconv.Itoa(count) + " requests)...")
+	var total int64
+	var min int64 = 99999
+	var max int64 = 0
+	for i := 0; i < count; i++ {
+		start := time.Now()
+		resp, err := httpClientFollow.Get(targetURL)
+		elapsed := time.Since(start).Milliseconds()
+		if err == nil {
+			resp.Body.Close()
+			total += elapsed
+			if elapsed < min { min = elapsed }
+			if elapsed > max { max = elapsed }
+		}
+	}
+	avg := total / int64(count)
+	results["min"] = strconv.FormatInt(min, 10) + "ms"
+	results["max"] = strconv.FormatInt(max, 10) + "ms"
+	results["avg"] = strconv.FormatInt(avg, 10) + "ms"
+	fmt.Println(COLORS["CYAN"] + "[timing] Min: " + results["min"] + " Max: " + results["max"] + " Avg: " + results["avg"] + COLORS["RESET"])
+	return results
+}
+
+func followRedirects(targetURL string) []string {
+	chain := []string{}
+	vroxInfo("[redirect] Following redirect chain...")
+	current := targetURL
+	for i := 0; i < 10; i++ {
+		resp, err := httpClient.Get(current)
+		if err != nil { break }
+		resp.Body.Close()
+		chain = append(chain, current + " -> " + strconv.Itoa(resp.StatusCode))
+		fmt.Println(COLORS["CYAN"] + "[redirect] " + current + " -> " + strconv.Itoa(resp.StatusCode) + COLORS["RESET"])
+		if resp.StatusCode != 301 && resp.StatusCode != 302 { break }
+		location := resp.Header.Get("Location")
+		if location == "" { break }
+		current = location
+	}
+	return chain
 }
 
 func regexSearch(pattern string, content string) []string {
 	re, err := regexp.Compile(pattern)
-	if err != nil {
-		fmt.Println(COLORS["RED"] + "[regex] Invalid pattern: " + err.Error() + COLORS["RESET"])
-		return []string{}
-	}
+	if err != nil { fmt.Println(COLORS["RED"] + "[regex] Invalid: " + err.Error() + COLORS["RESET"]); return []string{} }
 	matches := re.FindAllString(content, -1)
-	for _, m := range matches {
-		fmt.Println(COLORS["CYAN"] + "[regex] Found: " + m + COLORS["RESET"])
-	}
+	for _, m := range matches { fmt.Println(COLORS["CYAN"] + "[regex] " + m + COLORS["RESET"]) }
 	return matches
 }
 
@@ -875,49 +983,32 @@ func generateReport(target string, variables map[string]interface{}) string {
 		"Generated: " + now,
 		"============================================================",
 	}
-	sections := []struct {
-		key   string
-		title string
-	}{
-		{"resolved_ip", "IP Address"},
-		{"scan_results", "Subdomains"},
-		{"alive_results", "Alive Hosts"},
-		{"port_results", "Open Ports"},
-		{"tech_results", "Technologies"},
-		{"fuzz_results", "Directory Fuzz"},
-		{"wayback_results", "Wayback URLs"},
-		{"missing_headers", "Missing Security Headers"},
-		{"cors_results", "CORS Issues"},
-		{"takeover_results", "Subdomain Takeover"},
-		{"openredirect_results", "Open Redirect"},
-		{"sqli_results", "SQL Injection"},
-		{"xss_results", "XSS"},
-		{"ssl_results", "SSL Certificate"},
-		{"ratelimit_results", "Rate Limiting"},
-		{"email_results", "Emails"},
-		{"secrets_found", "Secrets Found"},
+	sections := []struct{ key, title string }{
+		{"resolved_ip","IP"}, {"scan_results","Subdomains"},
+		{"alive_results","Alive Hosts"}, {"port_results","Open Ports"},
+		{"tech_results","Technologies"}, {"fuzz_results","Fuzz Results"},
+		{"wayback_results","Wayback URLs"}, {"missing_headers","Missing Security Headers"},
+		{"cors_results","CORS Issues"}, {"takeover_results","Subdomain Takeover"},
+		{"openredirect_results","Open Redirect"}, {"sqli_results","SQL Injection"},
+		{"xss_results","XSS"}, {"ssrf_results","SSRF"}, {"lfi_results","LFI"},
+		{"crlf_results","CRLF"}, {"ssti_results","SSTI"},
+		{"ssl_results","SSL"}, {"ratelimit_results","Rate Limit"},
+		{"email_results","Emails"}, {"secrets_found","Secrets"},
 	}
-	for _, section := range sections {
-		if v, ok := variables[section.key]; ok {
+	for _, s := range sections {
+		if v, ok := variables[s.key]; ok {
 			switch val := v.(type) {
 			case []string:
 				if len(val) > 0 {
-					lines = append(lines, "\n["+section.title+": "+strconv.Itoa(len(val))+"]")
-					for _, s := range val {
-						lines = append(lines, "  "+s)
-					}
+					lines = append(lines, "\n["+s.title+": "+strconv.Itoa(len(val))+"]")
+					for _, item := range val { lines = append(lines, "  "+item) }
 				}
 			case string:
-				if val != "" {
-					lines = append(lines, "\n["+section.title+"]")
-					lines = append(lines, "  "+val)
-				}
+				if val != "" { lines = append(lines, "\n["+s.title+"]\n  "+val) }
 			case map[string]string:
 				if len(val) > 0 {
-					lines = append(lines, "\n["+section.title+"]")
-					for k, v2 := range val {
-						lines = append(lines, "  "+k+": "+v2)
-					}
+					lines = append(lines, "\n["+s.title+"]")
+					for k, v2 := range val { lines = append(lines, "  "+k+": "+v2) }
 				}
 			}
 		}
@@ -931,19 +1022,12 @@ func generateReport(target string, variables map[string]interface{}) string {
 
 func saveToFile(filename string, content string) {
 	err := os.WriteFile(filename, []byte(content), 0644)
-	if err != nil {
-		fmt.Println(COLORS["RED"] + "[save] Failed: " + err.Error() + COLORS["RESET"])
-	} else {
-		vroxInfo("[save] Written to " + filename)
-	}
+	if err != nil { fmt.Println(COLORS["RED"] + "[save] Failed: " + err.Error() + COLORS["RESET"]) } else { vroxInfo("[save] Written to " + filename) }
 }
 
 func importFile(filename string, variables map[string]interface{}, debug bool) {
 	data, err := os.ReadFile(filename)
-	if err != nil {
-		fmt.Println(COLORS["RED"] + "[import] Cannot open: " + filename + COLORS["RESET"])
-		return
-	}
+	if err != nil { fmt.Println(COLORS["RED"] + "[import] Cannot open: " + filename + COLORS["RESET"]); return }
 	vroxInfo("[import] Loading: " + filename)
 	runCode(string(data), variables, debug)
 }
@@ -952,177 +1036,127 @@ func importFile(filename string, variables map[string]interface{}, debug bool) {
 // INTERPRETER
 // ============================================================
 
+// breakSignal and continueSignal for loop control
+var breakSignal = false
+var continueSignal = false
+
 func runCode(code string, variables map[string]interface{}, debug bool) {
 	lines := strings.Split(code, "\n")
 	i := 0
-
 	for i < len(lines) {
+		if breakSignal || continueSignal { break }
 		line := strings.TrimSpace(lines[i])
-
-		if line == "" || strings.HasPrefix(line, "#") {
-			i++
-			continue
-		}
-
-		if debug {
-			fmt.Println(COLORS["YELLOW"] + "[debug] Line " + strconv.Itoa(i+1) + ": " + line + COLORS["RESET"])
-		}
-
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") { i++; continue }
+		if debug { fmt.Println(COLORS["YELLOW"] + "[debug] Line " + strconv.Itoa(i+1) + ": " + line + COLORS["RESET"]) }
 		saveTo := ""
 		if strings.Contains(line, ">>") {
 			parts := strings.SplitN(line, ">>", 2)
 			line = strings.TrimSpace(parts[0])
 			saveTo = strings.TrimSpace(parts[1])
 		}
-
 		switch {
 		case strings.HasPrefix(line, "if "):
 			condition := strings.TrimSuffix(strings.TrimPrefix(line, "if "), " {")
-			block := []string{}
-			elseBlock := []string{}
-			i++
-			inElse := false
+			block, elseBlock := []string{}, []string{}
+			i++; inElse := false
 			for i < len(lines) {
 				l := strings.TrimSpace(lines[i])
 				if l == "}" && !inElse {
-					if i+1 < len(lines) && strings.HasPrefix(strings.TrimSpace(lines[i+1]), "else") {
-						inElse = true
-						i += 2
-						continue
-					}
+					if i+1 < len(lines) && strings.HasPrefix(strings.TrimSpace(lines[i+1]), "else") { inElse = true; i += 2; continue }
 					break
-				} else if l == "}" && inElse {
-					break
-				} else if inElse {
-					elseBlock = append(elseBlock, lines[i])
-				} else {
-					block = append(block, lines[i])
-				}
+				} else if l == "}" && inElse { break
+				} else if inElse { elseBlock = append(elseBlock, lines[i])
+				} else { block = append(block, lines[i]) }
 				i++
 			}
-			if evalCondition(condition, variables) {
-				runCode(strings.Join(block, "\n"), variables, debug)
-			} else if len(elseBlock) > 0 {
-				runCode(strings.Join(elseBlock, "\n"), variables, debug)
-			}
+			if evalCondition(condition, variables) { runCode(strings.Join(block, "\n"), variables, debug)
+			} else if len(elseBlock) > 0 { runCode(strings.Join(elseBlock, "\n"), variables, debug) }
 
 		case strings.HasPrefix(line, "while "):
 			condition := strings.TrimSuffix(strings.TrimPrefix(line, "while "), " {")
-			block := []string{}
-			i++
+			block := []string{}; i++
 			for i < len(lines) {
-				if strings.TrimSpace(lines[i]) == "}" {
-					break
-				}
-				block = append(block, lines[i])
-				i++
+				if strings.TrimSpace(lines[i]) == "}" { break }
+				block = append(block, lines[i]); i++
 			}
 			count := 0
-			for evalCondition(condition, variables) && count < 1000 {
+			for evalCondition(condition, variables) && count < 10000 {
+				continueSignal = false
 				runCode(strings.Join(block, "\n"), variables, debug)
+				if breakSignal { breakSignal = false; break }
 				count++
 			}
 
 		case strings.HasPrefix(line, "repeat "):
 			parts := strings.Fields(line)
 			count, _ := strconv.Atoi(resolveValue(parts[1], variables))
-			block := []string{}
-			i++
+			block := []string{}; i++
 			for i < len(lines) {
-				if strings.TrimSpace(lines[i]) == "}" {
-					break
-				}
-				block = append(block, lines[i])
-				i++
+				if strings.TrimSpace(lines[i]) == "}" { break }
+				block = append(block, lines[i]); i++
 			}
 			for j := 0; j < count; j++ {
+				continueSignal = false
 				runCode(strings.Join(block, "\n"), variables, debug)
+				if breakSignal { breakSignal = false; break }
 			}
 
 		case strings.HasPrefix(line, "for "):
 			parts := strings.Fields(strings.TrimSuffix(line, " {"))
-			varName := parts[1]
-			listName := parts[3]
-			block := []string{}
-			i++
+			varName, listName := parts[1], parts[3]
+			block := []string{}; i++
 			for i < len(lines) {
-				if strings.TrimSpace(lines[i]) == "}" {
-					break
-				}
-				block = append(block, lines[i])
-				i++
+				if strings.TrimSpace(lines[i]) == "}" { break }
+				block = append(block, lines[i]); i++
 			}
 			if items, ok := variables[listName].([]string); ok {
 				for _, item := range items {
+					continueSignal = false
 					variables[varName] = item
 					runCode(strings.Join(block, "\n"), variables, debug)
+					if breakSignal { breakSignal = false; break }
 				}
 			}
 
 		case strings.HasPrefix(line, "func "):
 			name := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "func "), " {"))
-			block := []string{}
-			i++
+			block := []string{}; i++
 			for i < len(lines) {
-				if strings.TrimSpace(lines[i]) == "}" {
-					break
-				}
-				block = append(block, lines[i])
-				i++
+				if strings.TrimSpace(lines[i]) == "}" { break }
+				block = append(block, lines[i]); i++
 			}
 			variables["__func_"+name] = strings.Join(block, "\n")
 
 		case strings.HasPrefix(line, "call "):
 			parts := strings.Fields(line)
-			name := parts[1]
-			args := parts[2:]
+			name := parts[1]; args := parts[2:]
 			if code, ok := variables["__func_"+name].(string); ok {
 				localVars := map[string]interface{}{}
-				for k, v := range variables {
-					localVars[k] = v
-				}
-				for idx, arg := range args {
-					localVars["arg"+strconv.Itoa(idx+1)] = resolveValue(arg, variables)
-				}
+				for k, v := range variables { localVars[k] = v }
+				for idx, arg := range args { localVars["arg"+strconv.Itoa(idx+1)] = resolveValue(arg, variables) }
 				runCode(code, localVars, debug)
 				for k, v := range localVars {
-					if !strings.HasPrefix(k, "__func_") {
-						variables[k] = v
-					}
+					if !strings.HasPrefix(k, "__func_") { variables[k] = v }
 				}
-			} else {
-				vroxError("Unknown function: "+name, i+1)
-			}
+			} else { vroxError("Unknown function: "+name, i+1) }
 
 		case strings.HasPrefix(line, "try"):
-			tryBlock := []string{}
-			catchBlock := []string{}
-			i++
-			inCatch := false
+			tryBlock, catchBlock := []string{}, []string{}
+			i++; inCatch := false
 			for i < len(lines) {
 				l := strings.TrimSpace(lines[i])
 				if l == "}" && !inCatch {
-					if i+1 < len(lines) && strings.HasPrefix(strings.TrimSpace(lines[i+1]), "catch") {
-						inCatch = true
-						i += 2
-						continue
-					}
+					if i+1 < len(lines) && strings.HasPrefix(strings.TrimSpace(lines[i+1]), "catch") { inCatch = true; i += 2; continue }
 					break
-				} else if l == "}" && inCatch {
-					break
-				} else if inCatch {
-					catchBlock = append(catchBlock, lines[i])
-				} else {
-					tryBlock = append(tryBlock, lines[i])
-				}
+				} else if l == "}" && inCatch { break
+				} else if inCatch { catchBlock = append(catchBlock, lines[i])
+				} else { tryBlock = append(tryBlock, lines[i]) }
 				i++
 			}
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
-						if len(catchBlock) > 0 {
-							runCode(strings.Join(catchBlock, "\n"), variables, debug)
-						}
+						if len(catchBlock) > 0 { runCode(strings.Join(catchBlock, "\n"), variables, debug) }
 					}
 				}()
 				runCode(strings.Join(tryBlock, "\n"), variables, debug)
@@ -1131,7 +1165,6 @@ func runCode(code string, variables map[string]interface{}, debug bool) {
 		default:
 			interpretLine(line, i+1, variables, debug, saveTo)
 		}
-
 		i++
 	}
 }
@@ -1139,28 +1172,33 @@ func runCode(code string, variables map[string]interface{}, debug bool) {
 func interpretLine(line string, lineNum int, variables map[string]interface{}, debug bool, saveTo string) {
 	switch {
 
+	// ---- FLOW CONTROL ----
+	case line == "break":
+		breakSignal = true
+	case line == "continue":
+		continueSignal = true
+
 	// ---- COLOR SYSTEM ----
-	// setcolor MYCOLOR "\033[91m"
 	case strings.HasPrefix(line, "setcolor "):
 		parts := strings.SplitN(line[9:], " ", 2)
 		if len(parts) == 2 {
 			name := strings.TrimSpace(parts[0])
-			val := strings.TrimSpace(parts[1])
-			val = strings.Trim(val, "\"")
+			val := strings.Trim(strings.TrimSpace(parts[1]), "\"")
 			val = strings.ReplaceAll(val, "\\033", "\033")
 			variables["__color_"+name] = val
 			COLORS[name] = val
-			vroxInfo("[color] Set " + name + " = " + val + "example" + COLORS["RESET"])
+			vroxInfo("[color] Set " + name)
 		}
 
-	// getcolor MYCOLOR
 	case strings.HasPrefix(line, "getcolor "):
 		name := strings.TrimSpace(line[9:])
-		if c, ok := COLORS[name]; ok {
-			fmt.Println(c + name + COLORS["RESET"] + " = " + strconv.Quote(c))
+		if c, ok := COLORS[name]; ok { fmt.Println(c + name + COLORS["RESET"] + " = " + strconv.Quote(c)) }
+
+	case line == "colors":
+		for name, code := range COLORS {
+			fmt.Println(code + name + COLORS["RESET"])
 		}
 
-	// ---- BANNER (optional — user calls it) ----
 	case line == "banner":
 		fmt.Println(COLORS["PURPLE"] + COLORS["BOLD"] + `
  __   __ ____   ___  __  __
@@ -1169,7 +1207,7 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
    | |  |  _ <| |_| | |  | |
    |_|  |_| \_\\___/|_|  |_|
 ` + COLORS["RESET"])
-		fmt.Println(COLORS["CYAN"] + COLORS["BOLD"] + "  VroxScript " + VERSION + " — Security Scripting Language" + COLORS["RESET"])
+		fmt.Println(COLORS["CYAN"] + COLORS["BOLD"] + "  VroxScript " + VERSION + COLORS["RESET"])
 		fmt.Println(COLORS["GREEN"] + "  github.com/InterviewCopilot350/vroxscript" + COLORS["RESET"])
 		fmt.Println()
 
@@ -1181,51 +1219,88 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 			val := strings.TrimSpace(parts[1])
 			if strings.HasPrefix(val, "\"") {
 				variables[name] = resolveExpression(val, variables)
-			} else if strings.ContainsAny(val, "+-*/") {
+			} else if val == "true" {
+				variables[name] = true
+			} else if val == "false" {
+				variables[name] = false
+			} else if val == "null" {
+				variables[name] = nil
+			} else if strings.ContainsAny(val, "+-*/%") {
 				result := evalMath(val, variables)
-				if result == float64(int(result)) {
-					variables[name] = strconv.Itoa(int(result))
-				} else {
-					variables[name] = strconv.FormatFloat(result, 'f', 2, 64)
-				}
+				if result == float64(int(result)) { variables[name] = strconv.Itoa(int(result))
+				} else { variables[name] = strconv.FormatFloat(result, 'f', 2, 64) }
 			} else {
-				if v, ok := variables[val]; ok {
-					variables[name] = v
-				} else {
-					variables[name] = strings.Trim(val, "\"")
-				}
+				if v, ok := variables[val]; ok { variables[name] = v
+				} else { variables[name] = strings.Trim(val, "\"") }
 			}
-			if debug {
-				fmt.Println(COLORS["BLUE"] + "[debug] Set " + name + " = " + fmt.Sprint(variables[name]) + COLORS["RESET"])
+			if debug { fmt.Println(COLORS["BLUE"] + "[debug] Set " + name + " = " + fmt.Sprint(variables[name]) + COLORS["RESET"]) }
+		}
+
+	// ---- DICT ----
+	case strings.HasPrefix(line, "dict "):
+		parts := strings.SplitN(line[5:], "=", 2)
+		if len(parts) == 2 {
+			name := strings.TrimSpace(parts[0])
+			variables[name] = map[string]string{}
+			vroxInfo("[dict] Created: " + name)
+		}
+
+	case strings.HasPrefix(line, "dictset "):
+		parts := strings.Fields(line[8:])
+		if len(parts) == 3 {
+			dictName := parts[0]
+			key := strings.Trim(parts[1], "\"")
+			val := resolveExpression(parts[2], variables)
+			if d, ok := variables[dictName].(map[string]string); ok {
+				d[key] = val
+				variables[dictName] = d
 			}
+		}
+
+	case strings.HasPrefix(line, "dictget "):
+		parts := strings.Fields(line[8:])
+		if len(parts) == 2 {
+			dictName := parts[0]
+			key := strings.Trim(parts[1], "\"")
+			if d, ok := variables[dictName].(map[string]string); ok {
+				val := d[key]
+				variables["dictget_result"] = val
+				fmt.Println(val)
+			}
+		}
+
+	case strings.HasPrefix(line, "dictkeys "):
+		dictName := strings.TrimSpace(line[9:])
+		if d, ok := variables[dictName].(map[string]string); ok {
+			keys := []string{}
+			for k := range d { keys = append(keys, k) }
+			variables["dictkeys_result"] = keys
+			fmt.Println(keys)
 		}
 
 	// ---- OUTPUT ----
 	case strings.HasPrefix(line, "out "):
-		expr := strings.TrimSpace(line[4:])
-		result := resolveExpression(expr, variables)
+		result := resolveExpression(strings.TrimSpace(line[4:]), variables)
 		fmt.Println(result + COLORS["RESET"])
 
 	case strings.HasPrefix(line, "print "):
-		expr := strings.TrimSpace(line[6:])
-		result := resolveExpression(expr, variables)
+		result := resolveExpression(strings.TrimSpace(line[6:]), variables)
 		fmt.Println(result + COLORS["RESET"])
 
 	case strings.HasPrefix(line, "warn "):
-		expr := strings.TrimSpace(line[5:])
-		fmt.Println(COLORS["YELLOW"] + resolveExpression(expr, variables) + COLORS["RESET"])
+		fmt.Println(COLORS["YELLOW"] + resolveExpression(strings.TrimSpace(line[5:]), variables) + COLORS["RESET"])
 
 	case strings.HasPrefix(line, "error "):
-		expr := strings.TrimSpace(line[6:])
-		fmt.Println(COLORS["RED"] + resolveExpression(expr, variables) + COLORS["RESET"])
+		fmt.Println(COLORS["RED"] + resolveExpression(strings.TrimSpace(line[6:]), variables) + COLORS["RESET"])
 
 	case strings.HasPrefix(line, "success "):
-		expr := strings.TrimSpace(line[8:])
-		fmt.Println(COLORS["GREEN"] + resolveExpression(expr, variables) + COLORS["RESET"])
+		fmt.Println(COLORS["GREEN"] + resolveExpression(strings.TrimSpace(line[8:]), variables) + COLORS["RESET"])
 
 	case strings.HasPrefix(line, "info "):
-		expr := strings.TrimSpace(line[5:])
-		fmt.Println(COLORS["CYAN"] + resolveExpression(expr, variables) + COLORS["RESET"])
+		fmt.Println(COLORS["CYAN"] + resolveExpression(strings.TrimSpace(line[5:]), variables) + COLORS["RESET"])
+
+	case strings.HasPrefix(line, "bold "):
+		fmt.Println(COLORS["BOLD"] + resolveExpression(strings.TrimSpace(line[5:]), variables) + COLORS["RESET"])
 
 	// ---- INPUT ----
 	case strings.HasPrefix(line, "input "):
@@ -1235,12 +1310,11 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 		val, _ := reader.ReadString('\n')
 		variables[varName] = strings.TrimSpace(val)
 
-	// ---- SLEEP ----
+	// ---- SYSTEM ----
 	case strings.HasPrefix(line, "sleep "):
 		ms, _ := strconv.Atoi(resolveValue(line[6:], variables))
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 
-	// ---- SYSTEM EXEC ----
 	case strings.HasPrefix(line, "exec "):
 		cmd := resolveExpression(line[5:], variables)
 		out, err := exec.Command("sh", "-c", cmd).Output()
@@ -1248,76 +1322,99 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 			result := strings.TrimSpace(string(out))
 			variables["exec_result"] = result
 			fmt.Println(result)
-		} else {
-			fmt.Println(COLORS["RED"] + "[exec] Failed: " + err.Error() + COLORS["RESET"])
-		}
+		} else { fmt.Println(COLORS["RED"] + "[exec] Failed: " + err.Error() + COLORS["RESET"]) }
 
-	// ---- ENV VARIABLES ----
 	case strings.HasPrefix(line, "env "):
 		varName := strings.TrimSpace(line[4:])
 		val := os.Getenv(varName)
 		variables["env_"+varName] = val
 		fmt.Println(val)
 
-	// ---- ARGS ----
 	case line == "args":
-		args := os.Args
-		variables["args"] = args
-		fmt.Println(args)
+		variables["args"] = os.Args
+		fmt.Println(os.Args)
+
+	case line == "clear":
+		fmt.Print("\033[2J\033[H")
 
 	// ---- IMPORT ----
 	case strings.HasPrefix(line, "import "):
-		filename := strings.TrimSpace(line[7:])
-		importFile(filename, variables, debug)
+		importFile(strings.TrimSpace(line[7:]), variables, debug)
 
-	// ---- SECURITY COMMANDS ----
+	// ---- HTTP SETTINGS ----
+	case strings.HasPrefix(line, "setheader "):
+		parts := strings.SplitN(line[10:], " ", 2)
+		if len(parts) == 2 {
+			key := strings.Trim(parts[0], "\"")
+			val := resolveExpression(parts[1], variables)
+			globalHeaders[key] = val
+			vroxInfo("[header] Set " + key + ": " + val)
+		}
+
+	case strings.HasPrefix(line, "setcookie "):
+		parts := strings.SplitN(line[10:], " ", 2)
+		if len(parts) == 2 {
+			key := strings.Trim(parts[0], "\"")
+			val := resolveExpression(parts[1], variables)
+			globalCookies[key] = val
+			vroxInfo("[cookie] Set " + key + "=" + val)
+		}
+
+	case line == "clearcookies":
+		globalCookies = map[string]string{}
+		vroxInfo("[cookies] Cleared")
+
+	case line == "clearheaders":
+		globalHeaders = map[string]string{}
+		vroxInfo("[headers] Cleared")
+
+	// ---- SECURITY ----
 	case strings.HasPrefix(line, "resolve "):
 		domain := resolveValue(line[8:], variables)
 		ips, err := net.LookupHost(domain)
 		if err == nil {
 			variables["resolved_ip"] = ips[0]
 			vroxSuccess("[resolve] " + domain + " -> " + ips[0])
-			if saveTo != "" {
-				saveToFile(saveTo, ips[0])
-			}
+			if saveTo != "" { saveToFile(saveTo, ips[0]) }
 		} else {
 			variables["resolved_ip"] = ""
 			fmt.Println(COLORS["RED"] + "[resolve] " + domain + " -> failed" + COLORS["RESET"])
 		}
 
 	case strings.HasPrefix(line, "scan subdomains "):
-		domain := resolveValue(line[16:], variables)
-		vroxInfo("[scan] Scanning subdomains of " + domain + "...")
-		results := scanSubdomains(domain)
+		parts := strings.Fields(line[16:])
+		domain := resolveValue(parts[0], variables)
+		wordlistFile := ""
+		if len(parts) > 2 && parts[1] == "wordlist" { wordlistFile = resolveValue(parts[2], variables) }
+		vroxInfo("[scan] Scanning " + domain + "...")
+		results := scanSubdomains(domain, wordlistFile)
 		variables["scan_results"] = results
 		vroxSuccess("[scan] Found " + strconv.Itoa(len(results)) + " subdomains")
-		if saveTo != "" {
-			saveToFile(saveTo, strings.Join(results, "\n"))
-		}
+		if saveTo != "" { saveToFile(saveTo, strings.Join(results, "\n")) }
 
 	case strings.HasPrefix(line, "alive "):
 		varName := strings.TrimSpace(line[6:])
 		if hosts, ok := variables[varName].([]string); ok {
 			results := checkAlive(hosts)
 			variables["alive_results"] = results
-			if saveTo != "" {
-				saveToFile(saveTo, strings.Join(results, "\n"))
-			}
+			if saveTo != "" { saveToFile(saveTo, strings.Join(results, "\n")) }
 		}
 
 	case strings.HasPrefix(line, "ports "):
-		host := resolveValue(line[6:], variables)
+		parts := strings.Fields(line[6:])
+		host := resolveValue(parts[0], variables)
+		customPorts := []int{}
+		if len(parts) > 1 {
+			for _, p := range strings.Split(parts[1], ",") {
+				port, _ := strconv.Atoi(p)
+				if port > 0 { customPorts = append(customPorts, port) }
+			}
+		}
 		vroxInfo("[ports] Scanning " + host + "...")
-		results := scanPorts(host)
+		results := scanPorts(host, customPorts)
 		variables["port_results"] = results
-		portsStr := []string{}
-		for _, p := range results {
-			portsStr = append(portsStr, strconv.Itoa(p))
-		}
-		vroxSuccess("[ports] Open: " + strings.Join(portsStr, ", "))
-		if saveTo != "" {
-			saveToFile(saveTo, strings.Join(portsStr, "\n"))
-		}
+		vroxSuccess("[ports] Found " + strconv.Itoa(len(results)) + " open ports")
+		if saveTo != "" { saveToFile(saveTo, strings.Join(results, "\n")) }
 
 	case strings.HasPrefix(line, "headers "):
 		targetURL := resolveValue(line[8:], variables)
@@ -1326,9 +1423,7 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 		variables["header_results"] = results
 		if saveTo != "" {
 			content := ""
-			for k, v := range results {
-				content += k + ": " + v + "\n"
-			}
+			for k, v := range results { content += k + ": " + v + "\n" }
 			saveToFile(saveTo, content)
 		}
 
@@ -1337,9 +1432,7 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 		missing, present := checkSecHeaders(targetURL)
 		variables["missing_headers"] = missing
 		variables["present_headers"] = present
-		if saveTo != "" {
-			saveToFile(saveTo, "Missing: "+strings.Join(missing, ", ")+"\nPresent: "+strings.Join(present, ", "))
-		}
+		if saveTo != "" { saveToFile(saveTo, "Missing: "+strings.Join(missing, ", ")) }
 
 	case strings.HasPrefix(line, "dns "):
 		domain := resolveValue(line[4:], variables)
@@ -1348,9 +1441,7 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 		variables["dns_results"] = results
 		if saveTo != "" {
 			content := ""
-			for k, v := range results {
-				content += k + ": " + v + "\n"
-			}
+			for k, v := range results { content += k + ": " + v + "\n" }
 			saveToFile(saveTo, content)
 		}
 
@@ -1359,9 +1450,8 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 		status, body, _ := fetchPage(targetURL)
 		variables["fetch_status"] = status
 		variables["fetch_body"] = body
-		if saveTo != "" {
-			saveToFile(saveTo, strconv.Itoa(status))
-		}
+		variables["fetch_status_str"] = strconv.Itoa(status)
+		if saveTo != "" { saveToFile(saveTo, strconv.Itoa(status)) }
 
 	case strings.HasPrefix(line, "fetch post "):
 		parts := strings.SplitN(line[11:], " ", 2)
@@ -1370,9 +1460,7 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 		if len(parts) > 1 {
 			for _, p := range strings.Split(parts[1], "&") {
 				kv := strings.SplitN(p, "=", 2)
-				if len(kv) == 2 {
-					data.Set(resolveValue(kv[0], variables), resolveValue(kv[1], variables))
-				}
+				if len(kv) == 2 { data.Set(resolveValue(kv[0], variables), resolveValue(kv[1], variables)) }
 			}
 		}
 		resp, err := httpClientFollow.PostForm(targetURL, data)
@@ -1391,9 +1479,7 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 		results := crawlLinks(targetURL)
 		variables["crawl_results"] = results
 		vroxSuccess("[crawl] Found " + strconv.Itoa(len(results)) + " links")
-		if saveTo != "" {
-			saveToFile(saveTo, strings.Join(results, "\n"))
-		}
+		if saveTo != "" { saveToFile(saveTo, strings.Join(results, "\n")) }
 
 	case strings.HasPrefix(line, "js "):
 		targetURL := resolveValue(line[3:], variables)
@@ -1401,17 +1487,13 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 		results := extractJSUrls(targetURL)
 		variables["js_results"] = results
 		vroxSuccess("[js] Found " + strconv.Itoa(len(results)) + " endpoints")
-		if saveTo != "" {
-			saveToFile(saveTo, strings.Join(results, "\n"))
-		}
+		if saveTo != "" { saveToFile(saveTo, strings.Join(results, "\n")) }
 
 	case strings.HasPrefix(line, "params "):
 		targetURL := resolveValue(line[7:], variables)
 		results := extractParams(targetURL)
 		variables["param_results"] = results
-		if saveTo != "" {
-			saveToFile(saveTo, strings.Join(results, "\n"))
-		}
+		if saveTo != "" { saveToFile(saveTo, strings.Join(results, "\n")) }
 
 	case strings.HasPrefix(line, "wayback "):
 		domain := resolveValue(line[8:], variables)
@@ -1419,43 +1501,35 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 		results := waybackLookup(domain)
 		variables["wayback_results"] = results
 		vroxSuccess("[wayback] Found " + strconv.Itoa(len(results)) + " URLs")
-		if saveTo != "" {
-			saveToFile(saveTo, strings.Join(results, "\n"))
-		}
+		if saveTo != "" { saveToFile(saveTo, strings.Join(results, "\n")) }
 
 	case strings.HasPrefix(line, "fuzz "):
-		targetURL := resolveValue(line[5:], variables)
+		parts := strings.Fields(line[5:])
+		targetURL := resolveValue(parts[0], variables)
+		wordlistFile := ""
+		if len(parts) > 2 && parts[1] == "wordlist" { wordlistFile = resolveValue(parts[2], variables) }
 		vroxInfo("[fuzz] Fuzzing " + targetURL + "...")
-		results := fuzzDirs(targetURL)
+		results := fuzzDirs(targetURL, wordlistFile)
 		variables["fuzz_results"] = results
 		vroxSuccess("[fuzz] Found " + strconv.Itoa(len(results)) + " paths")
-		if saveTo != "" {
-			saveToFile(saveTo, strings.Join(results, "\n"))
-		}
+		if saveTo != "" { saveToFile(saveTo, strings.Join(results, "\n")) }
 
 	case strings.HasPrefix(line, "secrets "):
 		varName := strings.TrimSpace(line[8:])
 		content := fmt.Sprint(variables[varName])
-		vroxInfo("[secrets] Scanning for sensitive data...")
+		vroxInfo("[secrets] Scanning...")
 		results := grepSecrets(content)
 		variables["secrets_found"] = results
-		if saveTo != "" {
-			saveToFile(saveTo, fmt.Sprint(results))
-		}
+		if saveTo != "" { saveToFile(saveTo, fmt.Sprint(results)) }
 
 	case strings.HasPrefix(line, "takeover "):
 		domain := resolveValue(line[9:], variables)
 		subdomains := []string{}
-		if s, ok := variables["scan_results"].([]string); ok {
-			subdomains = s
-		} else {
-			subdomains = scanSubdomains(domain)
-		}
+		if s, ok := variables["scan_results"].([]string); ok { subdomains = s
+		} else { subdomains = scanSubdomains(domain, "") }
 		results := checkSubdomainTakeover(domain, subdomains)
 		variables["takeover_results"] = results
-		if saveTo != "" {
-			saveToFile(saveTo, strings.Join(results, "\n"))
-		}
+		if saveTo != "" { saveToFile(saveTo, strings.Join(results, "\n")) }
 
 	case strings.HasPrefix(line, "corscheck "):
 		targetURL := resolveValue(line[10:], variables)
@@ -1463,9 +1537,7 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 		variables["cors_results"] = results
 		if saveTo != "" {
 			content := ""
-			for k, v := range results {
-				content += k + ": " + v + "\n"
-			}
+			for k, v := range results { content += k + ": " + v + "\n" }
 			saveToFile(saveTo, content)
 		}
 
@@ -1475,9 +1547,7 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 		variables["ssl_results"] = results
 		if saveTo != "" {
 			content := ""
-			for k, v := range results {
-				content += k + ": " + v + "\n"
-			}
+			for k, v := range results { content += k + ": " + v + "\n" }
 			saveToFile(saveTo, content)
 		}
 
@@ -1485,83 +1555,102 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 		targetURL := resolveValue(line[11:], variables)
 		results := detectTech(targetURL)
 		variables["tech_results"] = results
-		if saveTo != "" {
-			saveToFile(saveTo, strings.Join(results, "\n"))
-		}
+		if saveTo != "" { saveToFile(saveTo, strings.Join(results, "\n")) }
 
 	case strings.HasPrefix(line, "emails "):
 		targetURL := resolveValue(line[7:], variables)
 		results := extractEmails(targetURL)
 		variables["email_results"] = results
-		if saveTo != "" {
-			saveToFile(saveTo, strings.Join(results, "\n"))
-		}
+		if saveTo != "" { saveToFile(saveTo, strings.Join(results, "\n")) }
 
 	case strings.HasPrefix(line, "whois "):
 		domain := resolveValue(line[6:], variables)
 		result := whoisLookup(domain)
 		variables["whois_result"] = result
-		if saveTo != "" {
-			saveToFile(saveTo, result)
-		}
+		if saveTo != "" { saveToFile(saveTo, result) }
 
 	case strings.HasPrefix(line, "ratelimit "):
 		targetURL := resolveValue(line[10:], variables)
 		results := checkRateLimit(targetURL)
 		variables["ratelimit_results"] = results
-		if saveTo != "" {
-			content := ""
-			for k, v := range results {
-				content += k + ": " + v + "\n"
-			}
-			saveToFile(saveTo, content)
-		}
 
 	case strings.HasPrefix(line, "openredirect "):
 		targetURL := resolveValue(line[13:], variables)
 		results := checkOpenRedirect(targetURL)
 		variables["openredirect_results"] = results
-		if saveTo != "" {
-			saveToFile(saveTo, strings.Join(results, "\n"))
-		}
+		if saveTo != "" { saveToFile(saveTo, strings.Join(results, "\n")) }
 
 	case strings.HasPrefix(line, "sqli "):
 		parts := strings.Fields(line[5:])
 		if len(parts) >= 2 {
-			targetURL := resolveValue(parts[0], variables)
-			param := resolveValue(parts[1], variables)
-			results := checkSQLi(targetURL, param)
+			results := checkSQLi(resolveValue(parts[0], variables), resolveValue(parts[1], variables))
 			variables["sqli_results"] = results
-			if saveTo != "" {
-				saveToFile(saveTo, strings.Join(results, "\n"))
-			}
+			if saveTo != "" { saveToFile(saveTo, strings.Join(results, "\n")) }
 		}
 
 	case strings.HasPrefix(line, "xsscheck "):
 		parts := strings.Fields(line[9:])
 		if len(parts) >= 2 {
-			targetURL := resolveValue(parts[0], variables)
-			param := resolveValue(parts[1], variables)
-			results := checkXSS(targetURL, param)
+			results := checkXSS(resolveValue(parts[0], variables), resolveValue(parts[1], variables))
 			variables["xss_results"] = results
-			if saveTo != "" {
-				saveToFile(saveTo, strings.Join(results, "\n"))
-			}
+			if saveTo != "" { saveToFile(saveTo, strings.Join(results, "\n")) }
 		}
+
+	case strings.HasPrefix(line, "ssrf "):
+		parts := strings.Fields(line[5:])
+		if len(parts) >= 2 {
+			results := checkSSRF(resolveValue(parts[0], variables), resolveValue(parts[1], variables))
+			variables["ssrf_results"] = results
+			if saveTo != "" { saveToFile(saveTo, strings.Join(results, "\n")) }
+		}
+
+	case strings.HasPrefix(line, "lfi "):
+		parts := strings.Fields(line[4:])
+		if len(parts) >= 2 {
+			results := checkLFI(resolveValue(parts[0], variables), resolveValue(parts[1], variables))
+			variables["lfi_results"] = results
+			if saveTo != "" { saveToFile(saveTo, strings.Join(results, "\n")) }
+		}
+
+	case strings.HasPrefix(line, "crlf "):
+		targetURL := resolveValue(line[5:], variables)
+		results := checkCRLF(targetURL)
+		variables["crlf_results"] = results
+		if saveTo != "" { saveToFile(saveTo, strings.Join(results, "\n")) }
+
+	case strings.HasPrefix(line, "ssti "):
+		parts := strings.Fields(line[5:])
+		if len(parts) >= 2 {
+			results := checkSSTI(resolveValue(parts[0], variables), resolveValue(parts[1], variables))
+			variables["ssti_results"] = results
+			if saveTo != "" { saveToFile(saveTo, strings.Join(results, "\n")) }
+		}
+
+	case strings.HasPrefix(line, "timing "):
+		parts := strings.Fields(line[7:])
+		targetURL := resolveValue(parts[0], variables)
+		count := 5
+		if len(parts) > 1 { count, _ = strconv.Atoi(parts[1]) }
+		results := measureResponseTime(targetURL, count)
+		variables["timing_results"] = results
+
+	case strings.HasPrefix(line, "redirectchain "):
+		targetURL := resolveValue(line[14:], variables)
+		results := followRedirects(targetURL)
+		variables["redirect_chain"] = results
+		if saveTo != "" { saveToFile(saveTo, strings.Join(results, "\n")) }
 
 	case strings.HasPrefix(line, "grep "):
 		parts := strings.SplitN(line[5:], " ", 2)
 		if len(parts) == 2 {
-			varName := parts[0]
-			keyword := strings.Trim(parts[1], "\"")
-			keyword = resolveValue(keyword, variables)
-			content := fmt.Sprint(variables[varName])
+			content := fmt.Sprint(variables[parts[0]])
+			keyword := resolveExpression(parts[1], variables)
 			if strings.Contains(strings.ToLower(content), strings.ToLower(keyword)) {
 				vroxSuccess("[grep] Found: " + keyword)
-				variables["grep_result"] = true
+				variables["grep_result"] = "true"
 			} else {
 				fmt.Println(COLORS["RED"] + "[grep] Not found: " + keyword + COLORS["RESET"])
-				variables["grep_result"] = false
+				variables["grep_result"] = "false"
 			}
 		}
 
@@ -1572,9 +1661,7 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 			content := fmt.Sprint(variables[strings.TrimSpace(parts[1])])
 			results := regexSearch(pattern, content)
 			variables["regex_result"] = results
-			if saveTo != "" {
-				saveToFile(saveTo, strings.Join(results, "\n"))
-			}
+			if saveTo != "" { saveToFile(saveTo, strings.Join(results, "\n")) }
 		}
 
 	case strings.HasPrefix(line, "report "):
@@ -1590,18 +1677,13 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 	// ---- FILE COMMANDS ----
 	case strings.HasPrefix(line, "save "):
 		parts := strings.SplitN(line[5:], " ", 2)
-		if len(parts) == 2 {
-			saveToFile(parts[0], resolveExpression(parts[1], variables))
-		}
+		if len(parts) == 2 { saveToFile(parts[0], resolveExpression(parts[1], variables)) }
 
 	case strings.HasPrefix(line, "show "):
 		filename := resolveValue(line[5:], variables)
 		data, err := os.ReadFile(filename)
-		if err == nil {
-			fmt.Println(string(data))
-		} else {
-			fmt.Println(COLORS["RED"] + "[show] Cannot open: " + filename + COLORS["RESET"])
-		}
+		if err == nil { fmt.Println(string(data))
+		} else { fmt.Println(COLORS["RED"] + "[show] Cannot open: " + filename + COLORS["RESET"]) }
 
 	case strings.HasPrefix(line, "read "):
 		filename := resolveValue(line[5:], variables)
@@ -1609,9 +1691,7 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 		if err == nil {
 			variables["read_result"] = string(data)
 			fmt.Println(string(data))
-		} else {
-			vroxError("Cannot read: "+filename, lineNum)
-		}
+		} else { vroxError("Cannot read: "+filename, lineNum) }
 
 	case strings.HasPrefix(line, "append "):
 		parts := strings.SplitN(line[7:], " ", 2)
@@ -1633,10 +1713,10 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 		filename := resolveValue(line[7:], variables)
 		if _, err := os.Stat(filename); err == nil {
 			vroxSuccess("[exists] " + filename + " -> yes")
-			variables["exists_result"] = true
+			variables["exists_result"] = "true"
 		} else {
 			fmt.Println(COLORS["RED"] + "[exists] " + filename + " -> no" + COLORS["RESET"])
-			variables["exists_result"] = false
+			variables["exists_result"] = "false"
 		}
 
 	case strings.HasPrefix(line, "lines "):
@@ -1646,6 +1726,156 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 			linesList := strings.Split(strings.TrimSpace(string(data)), "\n")
 			variables["lines_result"] = linesList
 			fmt.Println(len(linesList), "lines")
+		}
+
+	case strings.HasPrefix(line, "mkdir "):
+		dirName := resolveValue(line[6:], variables)
+		err := os.MkdirAll(dirName, 0755)
+		if err == nil { vroxSuccess("[mkdir] Created: " + dirName)
+		} else { fmt.Println(COLORS["RED"] + "[mkdir] Failed: " + err.Error() + COLORS["RESET"]) }
+
+	case strings.HasPrefix(line, "listdir "):
+		dirName := resolveValue(line[8:], variables)
+		entries, err := os.ReadDir(dirName)
+		if err == nil {
+			files := []string{}
+			for _, e := range entries {
+				files = append(files, e.Name())
+				fmt.Println(COLORS["CYAN"] + "[listdir] " + e.Name() + COLORS["RESET"])
+			}
+			variables["listdir_result"] = files
+		}
+
+	case strings.HasPrefix(line, "copyfile "):
+		parts := strings.Fields(line[9:])
+		if len(parts) == 2 {
+			src := resolveValue(parts[0], variables)
+			dst := resolveValue(parts[1], variables)
+			data, err := os.ReadFile(src)
+			if err == nil {
+				os.WriteFile(dst, data, 0644)
+				vroxSuccess("[copyfile] " + src + " -> " + dst)
+			}
+		}
+
+	case strings.HasPrefix(line, "movefile "):
+		parts := strings.Fields(line[9:])
+		if len(parts) == 2 {
+			src := resolveValue(parts[0], variables)
+			dst := resolveValue(parts[1], variables)
+			err := os.Rename(src, dst)
+			if err == nil { vroxSuccess("[movefile] " + src + " -> " + dst) }
+		}
+
+	case strings.HasPrefix(line, "filesize "):
+		filename := resolveValue(line[9:], variables)
+		info, err := os.Stat(filename)
+		if err == nil {
+			size := strconv.FormatInt(info.Size(), 10) + " bytes"
+			variables["filesize_result"] = size
+			fmt.Println(size)
+		}
+
+	case strings.HasPrefix(line, "compress "):
+		parts := strings.Fields(line[9:])
+		if len(parts) == 2 {
+			src := resolveValue(parts[0], variables)
+			dst := resolveValue(parts[1], variables)
+			zipFile, err := os.Create(dst)
+			if err == nil {
+				w := zip.NewWriter(zipFile)
+				filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+					if err != nil || info.IsDir() { return nil }
+					f, _ := w.Create(path)
+					data, _ := os.ReadFile(path)
+					f.Write(data)
+					return nil
+				})
+				w.Close()
+				zipFile.Close()
+				vroxSuccess("[compress] Created: " + dst)
+			}
+		}
+
+	case strings.HasPrefix(line, "decompress "):
+		parts := strings.Fields(line[11:])
+		if len(parts) == 2 {
+			src := resolveValue(parts[0], variables)
+			dst := resolveValue(parts[1], variables)
+			r, err := zip.OpenReader(src)
+			if err == nil {
+				os.MkdirAll(dst, 0755)
+				for _, f := range r.File {
+					rc, _ := f.Open()
+					outPath := dst + "/" + f.Name
+					outFile, _ := os.Create(outPath)
+					io.Copy(outFile, rc)
+					outFile.Close()
+					rc.Close()
+				}
+				r.Close()
+				vroxSuccess("[decompress] Extracted to: " + dst)
+			}
+		}
+
+	// ---- CSV ----
+	case strings.HasPrefix(line, "csvread "):
+		filename := resolveValue(line[8:], variables)
+		f, err := os.Open(filename)
+		if err == nil {
+			defer f.Close()
+			reader := csv.NewReader(f)
+			records, _ := reader.ReadAll()
+			rows := []string{}
+			for _, record := range records {
+				rows = append(rows, strings.Join(record, ","))
+				fmt.Println(COLORS["CYAN"] + strings.Join(record, " | ") + COLORS["RESET"])
+			}
+			variables["csv_result"] = rows
+		}
+
+	case strings.HasPrefix(line, "csvwrite "):
+		parts := strings.SplitN(line[9:], " ", 2)
+		if len(parts) == 2 {
+			filename := resolveValue(parts[0], variables)
+			data := resolveExpression(parts[1], variables)
+			f, err := os.Create(filename)
+			if err == nil {
+				w := csv.NewWriter(f)
+				for _, row := range strings.Split(data, "\n") {
+					w.Write(strings.Split(row, ","))
+				}
+				w.Flush()
+				f.Close()
+				vroxSuccess("[csvwrite] Written to " + filename)
+			}
+		}
+
+	// ---- JSON ----
+	case strings.HasPrefix(line, "jsonparse "):
+		varName := strings.TrimSpace(line[10:])
+		content := fmt.Sprint(variables[varName])
+		var result interface{}
+		err := json.Unmarshal([]byte(content), &result)
+		if err == nil {
+			variables["json_result"] = result
+			formatted, _ := json.MarshalIndent(result, "", "  ")
+			fmt.Println(string(formatted))
+		} else { fmt.Println(COLORS["RED"] + "[json] Parse error: " + err.Error() + COLORS["RESET"]) }
+
+	case strings.HasPrefix(line, "jsonget "):
+		parts := strings.Fields(line[8:])
+		if len(parts) == 2 {
+			varName := parts[0]
+			key := strings.Trim(parts[1], "\"")
+			content := fmt.Sprint(variables[varName])
+			var result map[string]interface{}
+			err := json.Unmarshal([]byte(content), &result)
+			if err == nil {
+				val := fmt.Sprint(result[key])
+				variables["jsonget_result"] = val
+				fmt.Println(val)
+			}
 		}
 
 	// ---- STRING OPERATIONS ----
@@ -1666,7 +1896,7 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 
 	case strings.HasPrefix(line, "strlen "):
 		val := resolveExpression(line[7:], variables)
-		variables["strlen_result"] = len(val)
+		variables["strlen_result"] = strconv.Itoa(len(val))
 		fmt.Println(len(val))
 
 	case strings.HasPrefix(line, "contains "):
@@ -1675,7 +1905,7 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 			val := resolveExpression(parts[0], variables)
 			sub := resolveExpression(parts[1], variables)
 			result := strings.Contains(val, sub)
-			variables["contains_result"] = result
+			variables["contains_result"] = strconv.FormatBool(result)
 			fmt.Println(result)
 		}
 
@@ -1685,7 +1915,7 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 			val := resolveExpression(parts[0], variables)
 			prefix := resolveExpression(parts[1], variables)
 			result := strings.HasPrefix(val, prefix)
-			variables["startswith_result"] = result
+			variables["startswith_result"] = strconv.FormatBool(result)
 			fmt.Println(result)
 		}
 
@@ -1695,7 +1925,7 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 			val := resolveExpression(parts[0], variables)
 			suffix := resolveExpression(parts[1], variables)
 			result := strings.HasSuffix(val, suffix)
-			variables["endswith_result"] = result
+			variables["endswith_result"] = strconv.FormatBool(result)
 			fmt.Println(result)
 		}
 
@@ -1743,25 +1973,182 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 			}
 		}
 
+	case strings.HasPrefix(line, "slice "):
+		parts := strings.Fields(line[6:])
+		if len(parts) == 3 {
+			val := resolveExpression(parts[0], variables)
+			start, _ := strconv.Atoi(resolveValue(parts[1], variables))
+			end, _ := strconv.Atoi(resolveValue(parts[2], variables))
+			if end > len(val) { end = len(val) }
+			result := val[start:end]
+			variables["slice_result"] = result
+			fmt.Println(result)
+		}
+
+	case strings.HasPrefix(line, "find "):
+		parts := strings.SplitN(line[5:], " in ", 2)
+		if len(parts) == 2 {
+			needle := resolveExpression(parts[0], variables)
+			haystack := resolveExpression(parts[1], variables)
+			idx := strings.Index(haystack, needle)
+			variables["find_result"] = strconv.Itoa(idx)
+			fmt.Println(idx)
+		}
+
+	case strings.HasPrefix(line, "pad "):
+		parts := strings.Fields(line[4:])
+		if len(parts) == 2 {
+			val := resolveExpression(parts[0], variables)
+			length, _ := strconv.Atoi(resolveValue(parts[1], variables))
+			for len(val) < length { val = val + " " }
+			variables["pad_result"] = val
+			fmt.Println(val)
+		}
+
+	case strings.HasPrefix(line, "repeat ") && strings.Contains(line, " times"):
+		// repeat "ha" 3 times
+		parts := strings.Fields(line)
+		if len(parts) == 4 {
+			str := resolveExpression(parts[1], variables)
+			count, _ := strconv.Atoi(resolveValue(parts[2], variables))
+			result := strings.Repeat(str, count)
+			variables["repeat_result"] = result
+			fmt.Println(result)
+		}
+
+	// ---- ENCODING ----
+	case strings.HasPrefix(line, "encode "):
+		val := resolveExpression(line[7:], variables)
+		result := base64.StdEncoding.EncodeToString([]byte(val))
+		variables["encode_result"] = result
+		fmt.Println(result)
+
+	case strings.HasPrefix(line, "decode "):
+		val := resolveExpression(line[7:], variables)
+		decoded, err := base64.StdEncoding.DecodeString(val)
+		if err == nil {
+			variables["decode_result"] = string(decoded)
+			fmt.Println(string(decoded))
+		} else { fmt.Println(COLORS["RED"] + "[decode] Failed" + COLORS["RESET"]) }
+
+	case strings.HasPrefix(line, "urlencode "):
+		val := resolveExpression(line[10:], variables)
+		result := url.QueryEscape(val)
+		variables["urlencode_result"] = result
+		fmt.Println(result)
+
+	case strings.HasPrefix(line, "urldecode "):
+		val := resolveExpression(line[10:], variables)
+		result, _ := url.QueryUnescape(val)
+		variables["urldecode_result"] = result
+		fmt.Println(result)
+
+	case strings.HasPrefix(line, "md5 "):
+		val := resolveExpression(line[4:], variables)
+		hash := md5.Sum([]byte(val))
+		result := fmt.Sprintf("%x", hash)
+		variables["md5_result"] = result
+		fmt.Println(result)
+
+	case strings.HasPrefix(line, "sha256 "):
+		val := resolveExpression(line[7:], variables)
+		hash := sha256.Sum256([]byte(val))
+		result := fmt.Sprintf("%x", hash)
+		variables["sha256_result"] = result
+		fmt.Println(result)
+
+	case strings.HasPrefix(line, "tonum "):
+		val := resolveExpression(line[6:], variables)
+		num, err := strconv.ParseFloat(val, 64)
+		if err == nil {
+			variables["tonum_result"] = num
+			fmt.Println(num)
+		}
+
+	case strings.HasPrefix(line, "tostr "):
+		val := resolveValue(line[6:], variables)
+		variables["tostr_result"] = fmt.Sprint(val)
+		fmt.Println(val)
+
+	// ---- LIST OPERATIONS ----
+	case strings.HasPrefix(line, "sort "):
+		varName := strings.TrimSpace(line[5:])
+		if items, ok := variables[varName].([]string); ok {
+			sorted := make([]string, len(items))
+			copy(sorted, items)
+			sort.Strings(sorted)
+			variables[varName] = sorted
+			variables["sort_result"] = sorted
+			fmt.Println(sorted)
+		}
+
+	case strings.HasPrefix(line, "reverse "):
+		varName := strings.TrimSpace(line[8:])
+		if items, ok := variables[varName].([]string); ok {
+			reversed := make([]string, len(items))
+			for i, v := range items { reversed[len(items)-1-i] = v }
+			variables[varName] = reversed
+			variables["reverse_result"] = reversed
+			fmt.Println(reversed)
+		}
+
+	case strings.HasPrefix(line, "unique "):
+		varName := strings.TrimSpace(line[7:])
+		if items, ok := variables[varName].([]string); ok {
+			seen := map[string]bool{}
+			unique := []string{}
+			for _, item := range items {
+				if !seen[item] { seen[item] = true; unique = append(unique, item) }
+			}
+			variables[varName] = unique
+			variables["unique_result"] = unique
+			fmt.Println(unique)
+		}
+
 	case strings.HasPrefix(line, "count "):
 		varName := strings.TrimSpace(line[6:])
 		switch v := variables[varName].(type) {
 		case []string:
-			variables["count_result"] = len(v)
+			variables["count_result"] = strconv.Itoa(len(v))
 			fmt.Println(len(v))
 		case string:
-			variables["count_result"] = len(v)
+			variables["count_result"] = strconv.Itoa(len(v))
 			fmt.Println(len(v))
 		default:
-			variables["count_result"] = 0
+			variables["count_result"] = "0"
 			fmt.Println(0)
+		}
+
+	case strings.HasPrefix(line, "push "):
+		parts := strings.SplitN(line[5:], " ", 2)
+		if len(parts) == 2 {
+			name := strings.TrimSpace(parts[0])
+			val := resolveExpression(parts[1], variables)
+			if items, ok := variables[name].([]string); ok { variables[name] = append(items, val)
+			} else { variables[name] = []string{val} }
+		}
+
+	case strings.HasPrefix(line, "pop "):
+		name := strings.TrimSpace(line[4:])
+		if items, ok := variables[name].([]string); ok && len(items) > 0 {
+			variables[name] = items[:len(items)-1]
+		}
+
+	case strings.HasPrefix(line, "list "):
+		parts := strings.SplitN(line[5:], "=", 2)
+		if len(parts) == 2 {
+			name := strings.TrimSpace(parts[0])
+			val := strings.Trim(strings.TrimSpace(parts[1]), "[]")
+			items := strings.Split(val, ",")
+			result := []string{}
+			for _, item := range items { result = append(result, strings.TrimSpace(strings.Trim(item, "\""))) }
+			variables[name] = result
 		}
 
 	// ---- MATH ----
 	case strings.HasPrefix(line, "math "):
-		expr := line[5:]
-		result := evalMath(expr, variables)
-		variables["math_result"] = result
+		result := evalMath(line[5:], variables)
+		variables["math_result"] = strconv.FormatFloat(result, 'f', -1, 64)
 		fmt.Println(result)
 
 	case strings.HasPrefix(line, "randint "):
@@ -1770,13 +2157,13 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 			min, _ := strconv.Atoi(resolveValue(parts[0], variables))
 			max, _ := strconv.Atoi(resolveValue(parts[1], variables))
 			result := rand.Intn(max-min+1) + min
-			variables["randint_result"] = result
+			variables["randint_result"] = strconv.Itoa(result)
 			fmt.Println(result)
 		}
 
 	case line == "random":
 		result := rand.Float64()
-		variables["random_result"] = result
+		variables["random_result"] = fmt.Sprint(result)
 		fmt.Println(result)
 
 	case strings.HasPrefix(line, "timestamp"):
@@ -1792,81 +2179,58 @@ func interpretLine(line string, lineNum int, variables map[string]interface{}, d
 			fmt.Println(t)
 		}
 
-	// ---- LIST OPERATIONS ----
-	case strings.HasPrefix(line, "push "):
-		parts := strings.SplitN(line[5:], " ", 2)
-		if len(parts) == 2 {
-			name := strings.TrimSpace(parts[0])
-			val := resolveExpression(parts[1], variables)
-			if items, ok := variables[name].([]string); ok {
-				variables[name] = append(items, val)
-			} else {
-				variables[name] = []string{val}
-			}
-		}
-
-	case strings.HasPrefix(line, "pop "):
-		name := strings.TrimSpace(line[4:])
-		if items, ok := variables[name].([]string); ok && len(items) > 0 {
-			variables[name] = items[:len(items)-1]
-		}
-
-	case strings.HasPrefix(line, "list "):
-		parts := strings.SplitN(line[5:], "=", 2)
-		if len(parts) == 2 {
-			name := strings.TrimSpace(parts[0])
-			val := strings.TrimSpace(parts[1])
-			val = strings.Trim(val, "[]")
-			items := strings.Split(val, ",")
-			result := []string{}
-			for _, item := range items {
-				result = append(result, strings.TrimSpace(strings.Trim(item, "\"")))
-			}
-			variables[name] = result
-		}
+	case line == "clear":
+		fmt.Print("\033[2J\033[H")
 	}
 }
 
 func showHelp() {
 	fmt.Println(COLORS["CYAN"] + COLORS["BOLD"] + "\nVroxScript " + VERSION + " — Security Scripting Language" + COLORS["RESET"])
 	fmt.Println(COLORS["GREEN"] + "github.com/InterviewCopilot350/vroxscript\n" + COLORS["RESET"])
-
 	fmt.Println(COLORS["YELLOW"] + "USAGE:" + COLORS["RESET"])
-	fmt.Println("  vrox file.vs            Run a script")
+	fmt.Println("  vrox file.vs            Run script")
 	fmt.Println("  vrox --debug file.vs    Debug mode")
 	fmt.Println("  vrox --version          Version")
 	fmt.Println("  vrox --help             Help")
-	fmt.Println("  vrox                    Interactive mode")
-
-	fmt.Println(COLORS["YELLOW"] + "\nCOLOR SYSTEM (new in 2.0):" + COLORS["RESET"])
-	fmt.Println(COLORS["GREEN"] + "  setcolor MYCOLOR \"\\033[91m\"" + COLORS["RESET"] + "  Define custom color")
-	fmt.Println(COLORS["GREEN"] + "  print \"{RED}Hello{RESET}\"" + COLORS["RESET"] + "      Use color in string")
-	fmt.Println(COLORS["GREEN"] + "  getcolor RED" + COLORS["RESET"] + "                Show color value")
-	fmt.Println(COLORS["GREEN"] + "  banner" + COLORS["RESET"] + "                      Show VroxScript banner")
-
-	fmt.Println(COLORS["YELLOW"] + "\nNEW 2.0 COMMANDS:" + COLORS["RESET"])
-	fmt.Println(COLORS["GREEN"] + "  takeover domain" + COLORS["RESET"] + "         Subdomain takeover")
-	fmt.Println(COLORS["GREEN"] + "  corscheck https://url" + COLORS["RESET"] + "   CORS misconfiguration")
-	fmt.Println(COLORS["GREEN"] + "  sqli https://url param" + COLORS["RESET"] + "  SQL injection")
-	fmt.Println(COLORS["GREEN"] + "  xsscheck https://url param" + COLORS["RESET"] + " XSS detection")
-	fmt.Println(COLORS["GREEN"] + "  openredirect https://url" + COLORS["RESET"] + " Open redirect")
-	fmt.Println(COLORS["GREEN"] + "  techdetect https://url" + COLORS["RESET"] + "  Detect technologies")
-	fmt.Println(COLORS["GREEN"] + "  emails https://url" + COLORS["RESET"] + "      Extract emails")
-	fmt.Println(COLORS["GREEN"] + "  whois domain" + COLORS["RESET"] + "            WHOIS lookup")
-	fmt.Println(COLORS["GREEN"] + "  ssl https://url" + COLORS["RESET"] + "         SSL certificate check")
-	fmt.Println(COLORS["GREEN"] + "  ratelimit https://url" + COLORS["RESET"] + "   Rate limit check")
-	fmt.Println(COLORS["GREEN"] + "  sleep 1000" + COLORS["RESET"] + "              Sleep milliseconds")
-	fmt.Println(COLORS["GREEN"] + "  exec \"command\"" + COLORS["RESET"] + "          Run system command")
-	fmt.Println(COLORS["GREEN"] + "  env VARNAME" + COLORS["RESET"] + "             Read env variable")
-	fmt.Println(COLORS["GREEN"] + "  contains var sub" + COLORS["RESET"] + "        String contains check")
-	fmt.Println(COLORS["GREEN"] + "  startswith var prefix" + COLORS["RESET"] + "   String starts with")
-	fmt.Println(COLORS["GREEN"] + "  endswith var suffix" + COLORS["RESET"] + "     String ends with")
-	fmt.Println(COLORS["GREEN"] + "  trim var" + COLORS["RESET"] + "                Trim whitespace")
-	fmt.Println(COLORS["GREEN"] + "  join list with \",\"" + COLORS["RESET"] + "      Join list to string")
-	fmt.Println(COLORS["GREEN"] + "  index list 0" + COLORS["RESET"] + "            Get item by index")
-	fmt.Println(COLORS["GREEN"] + "  lines file.txt" + COLORS["RESET"] + "          Read file as list")
-	fmt.Println(COLORS["GREEN"] + "  success \"message\"" + COLORS["RESET"] + "       Green output")
-	fmt.Println(COLORS["GREEN"] + "  info \"message\"" + COLORS["RESET"] + "          Cyan output")
+	fmt.Println("  vrox                    Interactive")
+	fmt.Println(COLORS["YELLOW"] + "\nSECURITY (NEW IN 2.1):" + COLORS["RESET"])
+	cmds := [][]string{
+		{"ssrf url param","SSRF testing"},{"lfi url param","LFI testing"},
+		{"crlf url","CRLF injection"},{"ssti url param","SSTI testing"},
+		{"timing url count","Response timing"},{"redirectchain url","Follow redirects"},
+		{"scan subdomains d wordlist f","Custom wordlist scan"},
+		{"fuzz url wordlist f","Custom wordlist fuzz"},
+		{"ports host 80,443,8080","Custom ports"},
+	}
+	for _, cmd := range cmds {
+		fmt.Println(COLORS["GREEN"]+"  "+cmd[0]+COLORS["RESET"]+" — "+cmd[1])
+	}
+	fmt.Println(COLORS["YELLOW"] + "\nCOLORS:" + COLORS["RESET"])
+	fmt.Println(COLORS["GREEN"]+"  setcolor NAME \"\\033[91m\""+COLORS["RESET"]+" Define color")
+	fmt.Println(COLORS["GREEN"]+"  print \"{RED}text{RESET}\""+COLORS["RESET"]+" Use color")
+	fmt.Println(COLORS["GREEN"]+"  colors"+COLORS["RESET"]+" Show all colors")
+	fmt.Println(COLORS["GREEN"]+"  banner"+COLORS["RESET"]+" Show logo")
+	fmt.Println(COLORS["YELLOW"] + "\nENCODING:" + COLORS["RESET"])
+	fmt.Println(COLORS["GREEN"]+"  encode/decode"+COLORS["RESET"]+" Base64")
+	fmt.Println(COLORS["GREEN"]+"  urlencode/urldecode"+COLORS["RESET"]+" URL encoding")
+	fmt.Println(COLORS["GREEN"]+"  md5/sha256"+COLORS["RESET"]+" Hashing")
+	fmt.Println(COLORS["YELLOW"] + "\nDATA:" + COLORS["RESET"])
+	fmt.Println(COLORS["GREEN"]+"  dict/dictset/dictget/dictkeys"+COLORS["RESET"]+" Dictionary")
+	fmt.Println(COLORS["GREEN"]+"  jsonparse/jsonget"+COLORS["RESET"]+" JSON")
+	fmt.Println(COLORS["GREEN"]+"  csvread/csvwrite"+COLORS["RESET"]+" CSV")
+	fmt.Println(COLORS["GREEN"]+"  sort/reverse/unique"+COLORS["RESET"]+" List ops")
+	fmt.Println(COLORS["YELLOW"] + "\nFILES:" + COLORS["RESET"])
+	fmt.Println(COLORS["GREEN"]+"  mkdir/listdir/copyfile/movefile/filesize"+COLORS["RESET"])
+	fmt.Println(COLORS["GREEN"]+"  compress/decompress"+COLORS["RESET"]+" ZIP files")
+	fmt.Println(COLORS["YELLOW"] + "\nHTTP:" + COLORS["RESET"])
+	fmt.Println(COLORS["GREEN"]+"  setheader key value"+COLORS["RESET"]+" Set global header")
+	fmt.Println(COLORS["GREEN"]+"  setcookie key value"+RESET+" Set cookie")
+	fmt.Println(COLORS["GREEN"]+"  clearcookies/clearheaders"+COLORS["RESET"])
+	fmt.Println(COLORS["YELLOW"] + "\nLANGUAGE:" + COLORS["RESET"])
+	fmt.Println(COLORS["GREEN"]+"  break/continue"+COLORS["RESET"]+" Loop control")
+	fmt.Println(COLORS["GREEN"]+"  let x = true/false/null"+COLORS["RESET"]+" Types")
+	fmt.Println(COLORS["GREEN"]+"  tonum/tostr"+COLORS["RESET"]+" Type conversion")
+	fmt.Println(COLORS["GREEN"]+"  slice/find/pad"+COLORS["RESET"]+" String ops")
 }
 
 func showVersion() {
@@ -1876,51 +2240,32 @@ func showVersion() {
 
 func interactive() {
 	fmt.Println(COLORS["CYAN"] + COLORS["BOLD"] + "VroxScript " + VERSION + " — Interactive Mode" + COLORS["RESET"])
-	fmt.Println(COLORS["YELLOW"] + "Type 'exit' to quit | Type 'banner' to show logo\n" + COLORS["RESET"])
+	fmt.Println(COLORS["YELLOW"] + "Type 'exit' to quit | 'banner' for logo | 'colors' for palette\n" + COLORS["RESET"])
 	variables := map[string]interface{}{}
 	reader := bufio.NewReader(os.Stdin)
 	for {
 		fmt.Print(COLORS["GREEN"] + "vrox> " + COLORS["RESET"])
 		line, _ := reader.ReadString('\n')
 		line = strings.TrimSpace(line)
-		if line == "exit" {
-			fmt.Println(COLORS["CYAN"] + "Bye!" + COLORS["RESET"])
-			break
-		}
-		if line != "" {
-			interpretLine(line, 1, variables, false, "")
-		}
+		if line == "exit" { fmt.Println(COLORS["CYAN"] + "Bye!" + COLORS["RESET"]); break }
+		if line != "" { interpretLine(line, 1, variables, false, "") }
 	}
 }
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
-	if len(os.Args) < 2 {
-		interactive()
-		return
-	}
+	if len(os.Args) < 2 { interactive(); return }
 	switch os.Args[1] {
-	case "--help":
-		showHelp()
-	case "--version":
-		showVersion()
+	case "--help": showHelp()
+	case "--version": showVersion()
 	case "--debug":
-		if len(os.Args) < 3 {
-			fmt.Println(COLORS["RED"] + "Error: No file specified" + COLORS["RESET"])
-			return
-		}
+		if len(os.Args) < 3 { fmt.Println(COLORS["RED"] + "Error: No file" + COLORS["RESET"]); return }
 		data, err := os.ReadFile(os.Args[2])
-		if err != nil {
-			fmt.Println(COLORS["RED"] + "Error: Cannot open file" + COLORS["RESET"])
-			return
-		}
+		if err != nil { fmt.Println(COLORS["RED"] + "Error: Cannot open file" + COLORS["RESET"]); return }
 		runCode(string(data), map[string]interface{}{}, true)
 	default:
 		data, err := os.ReadFile(os.Args[1])
-		if err != nil {
-			fmt.Println(COLORS["RED"] + "Error: Cannot open file: " + os.Args[1] + COLORS["RESET"])
-			return
-		}
+		if err != nil { fmt.Println(COLORS["RED"] + "Error: " + os.Args[1] + COLORS["RESET"]); return }
 		runCode(string(data), map[string]interface{}{}, false)
 	}
 }
