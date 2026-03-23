@@ -2,60 +2,80 @@ filetype: vrox
 detect:
     filename: "\\.vs$"
 rules:
-    # Core keywords — blue
-    - statement: "\\b(let|if|else|while|for|in|repeat|func|call|try|catch|return|break|continue|import|and|or|not)\\b"
+    # ---- KEYWORDS (blue) ----
+    - statement: "\\b(let|if|else|unless|while|for|in|repeat|loop|as|func|call|try|catch|return|break|continue|import|and|or|not|switch|case|default)\\b"
 
-    # Output commands — green
-    - type: "\\b(out|print|banner|colors|clear)\\b"
-
-    # Colored output commands — each different
-    - preproc.define: "\\b(success|bold)\\b"
-    - preproc: "\\b(warn|warning)\\b"
-    - error: "\\b(error)\\b"
-    - constant: "\\b(info)\\b"
-    - label: "\\b(orange|pink|gold|teal|lime)\\b"
-
-    # Vulnerability commands — red (dangerous)
-    - error: "\\b(sqli|xsscheck|ssrf|lfi|crlf|ssti|corscheck|takeover|openredirect|secrets|ratelimit)\\b"
-
-    # Passive recon — teal
-    - constant.string: "\\b(passive|nopassive|probe)\\b"
-
-    # Network/recon — cyan
-    - constant: "\\b(scan|subdomains|alive|ports|headers|secheaders|dns|crawl|js|params|wayback|fuzz|resolve|whois|emails|techdetect|ssl|timing|redirectchain|fetch|get|post|report|grep|regex|template|templates)\\b"
-
-    # File commands — yellow
-    - special: "\\b(save|show|read|append|delete|exists|lines|mkdir|listdir|copyfile|movefile|filesize|compress|decompress|csvread|csvwrite)\\b"
-
-    # Data commands — purple
-    - identifier: "\\b(dict|dictset|dictget|dictkeys|jsonparse|jsonget|sort|reverse|unique|push|pop|list|count|index|join|split|replace|upper|lower|trim|strlen|contains|startswith|endswith|slice|find|pad|encode|decode|urlencode|urldecode|md5|sha256|tonum|tostr|math|randint|random|timestamp|type)\\b"
-
-    # HTTP/Color/Key settings — orange
-    - symbol: "\\b(setheader|setcookie|clearcookies|clearheaders|setcolor|getcolor|setkey|getkey|listkeys)\\b"
-
-    # System commands
-    - preproc.define: "\\b(exec|env|args|sleep|input)\\b"
-
-    # Strings — green
-    - constant.string: "\"[^\"]*\""
-
-    # Numbers — yellow
-    - constant.number: "\\b[0-9]+(\\.[0-9]+)?\\b"
-
-    # Comments — gray/dim
-    - comment: "(#.*|//.*)"
-
-    # Operators
-    - symbol.operator: "(>>|->|==|!=|>=|<=|>|<|\\+|-|\\*|/|%)"
-
-    # Boolean/null
+    # ---- BOOLEAN/NULL (blue bold) ----
     - type.keyword: "\\b(true|false|null)\\b"
 
-    # Color variables in strings
+    # ---- PLAIN OUTPUT (green) ----
+    - type: "\\b(out|print|banner|colors|clear|divider|newline)\\b"
+
+    # ---- COLORED OUTPUT CMDS (each different color) ----
+    - preproc.define: "\\b(success|bold)\\b"
+    - special: "\\b(warn|warning)\\b"
+    - error: "\\b(error|raise)\\b"
+    - constant: "\\b(info|teal)\\b"
+    - label: "\\b(orange|pink|gold|lime|violet|coral|silver|maroon|navy)\\b"
+    - identifier: "\\b(bold)\\b"
+
+    # ---- UI/OUTPUT FUNCTIONS (yellow) ----
+    - special: "\\b(table|progress|spinner|ask)\\b"
+
+    # ---- ASSERTION (orange) ----
+    - symbol: "\\b(assert)\\b"
+
+    # ---- VULNERABILITY CMDS (red) ----
+    - error: "\\b(sqli|xsscheck|ssrf|lfi|crlf|ssti|corscheck|takeover|openredirect|secrets|ratelimit|mineParams)\\b"
+
+    # ---- PASSIVE RECON (teal/cyan) ----
+    - constant.string: "\\b(nopassive|passive|probe)\\b"
+
+    # ---- NETWORK/RECON CMDS (cyan) ----
+    - constant: "\\b(scan|subdomains|alive|ports|headers|secheaders|dns|crawl|js|params|wayback|fuzz|resolve|whois|emails|techdetect|ssl|timing|redirectchain|fetch|get|post|report|grep|regex|template|templates|ping|cidr|favicon|cdn|banner_grab)\\b"
+
+    # ---- FILE CMDS (yellow) ----
+    - special: "\\b(save|show|read|append|delete|exists|lines|mkdir|listdir|copyfile|movefile|filesize|compress|decompress|csvread|csvwrite|filetype|filename|dirname|currentdir|homedir)\\b"
+
+    # ---- DATA CMDS (purple) ----
+    - identifier: "\\b(dict|dictset|dictget|dictkeys|jsonparse|jsonget|sort|reverse|unique|filter|remove|contains_all|push|pop|list|count|index|join|split|replace|upper|lower|trim|strlen|contains|startswith|endswith|slice|find|pad|encode|decode|urlencode|urldecode|md5|sha256|tonum|tostr|reverse_str|repeat_str|count_str|between)\\b"
+
+    # ---- MATH CMDS (gold/yellow) ----
+    - preproc: "\\b(math|abs|floor|ceil|round|sqrt|power|max|min|sum|avg|randint|random)\\b"
+
+    # ---- TYPE CHECKING (blue) ----
+    - statement: "\\b(isnull|islist|isdict|isnum|isstr|isbool|isnumber|isalpha|isempty|isip|isdomain|type)\\b"
+
+    # ---- HTTP/COLOR/KEY (orange) ----
+    - symbol: "\\b(setheader|setcookie|clearcookies|clearheaders|setcolor|getcolor|setkey|getkey|listkeys)\\b"
+
+    # ---- SYSTEM CMDS (pink) ----
+    - label: "\\b(exec|env|args|sleep|input|now|date|time|elapsed|timestamp)\\b"
+
+    # ---- STRINGS (green) ----
+    - constant.string: "\"[^\"]*\""
+    - constant.string: "\"\"\"[^\"]*\"\"\""
+
+    # ---- NUMBERS (yellow) ----
+    - constant.number: "\\b[0-9]+(\\.[0-9]+)?\\b"
+
+    # ---- COMMENTS (gray) ----
+    - comment: "(#.*|//.*)"
+
+    # ---- OPERATORS (white/bright) ----
+    - symbol.operator: "(>>|->|==|!=|>=|<=|>|<|\\+|-|\\*|/|%)"
+
+    # ---- COLOR VARS IN STRINGS (bright) ----
     - preproc: "\\{[A-Z_]+\\}"
 
-    # Block delimiters
+    # ---- BLOCKS (white) ----
     - symbol.brackets: "[{}]"
 
-    # Template keywords
-    - type: "\\b(wordlist|filter-status|filter-size|threads)\\b"
+    # ---- FUZZ OPTIONS (teal) ----
+    - type: "\\b(wordlist|filter-status|filter-size|threads|method|data)\\b"
+
+    # ---- SEVERITY KEYWORDS (red for critical) ----
+    - error: "\\b(critical|CRITICAL)\\b"
+    - special: "\\b(high|HIGH)\\b"
+    - preproc: "\\b(medium|MEDIUM)\\b"
+    - constant: "\\b(low|LOW|info|INFO)\\b"
