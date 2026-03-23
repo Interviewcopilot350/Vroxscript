@@ -2,17 +2,27 @@ filetype: vrox
 detect:
     filename: "\\.vs$"
 rules:
-    # Keywords — blue
+    # Core keywords — blue
     - statement: "\\b(let|if|else|while|for|in|repeat|func|call|try|catch|return|break|continue|import|and|or|not)\\b"
 
     # Output commands — green
-    - type: "\\b(out|print|warn|error|success|info|bold|banner|colors|clear)\\b"
+    - type: "\\b(out|print|banner|colors|clear)\\b"
 
-    # Security commands — red (dangerous/important)
-    - preproc: "\\b(sqli|xsscheck|ssrf|lfi|crlf|ssti|corscheck|takeover|openredirect|secrets|ratelimit)\\b"
+    # Colored output commands — each different
+    - preproc.define: "\\b(success|bold)\\b"
+    - preproc: "\\b(warn|warning)\\b"
+    - error: "\\b(error)\\b"
+    - constant: "\\b(info)\\b"
+    - label: "\\b(orange|pink|gold|teal|lime)\\b"
 
-    # Network/recon commands — cyan
-    - constant: "\\b(scan|subdomains|alive|ports|headers|secheaders|dns|crawl|js|params|wayback|fuzz|resolve|whois|emails|techdetect|ssl|timing|redirectchain|fetch|get|post|report|grep|regex)\\b"
+    # Vulnerability commands — red (dangerous)
+    - error: "\\b(sqli|xsscheck|ssrf|lfi|crlf|ssti|corscheck|takeover|openredirect|secrets|ratelimit)\\b"
+
+    # Passive recon — teal
+    - constant.string: "\\b(passive|nopassive|probe)\\b"
+
+    # Network/recon — cyan
+    - constant: "\\b(scan|subdomains|alive|ports|headers|secheaders|dns|crawl|js|params|wayback|fuzz|resolve|whois|emails|techdetect|ssl|timing|redirectchain|fetch|get|post|report|grep|regex|template|templates)\\b"
 
     # File commands — yellow
     - special: "\\b(save|show|read|append|delete|exists|lines|mkdir|listdir|copyfile|movefile|filesize|compress|decompress|csvread|csvwrite)\\b"
@@ -20,11 +30,11 @@ rules:
     # Data commands — purple
     - identifier: "\\b(dict|dictset|dictget|dictkeys|jsonparse|jsonget|sort|reverse|unique|push|pop|list|count|index|join|split|replace|upper|lower|trim|strlen|contains|startswith|endswith|slice|find|pad|encode|decode|urlencode|urldecode|md5|sha256|tonum|tostr|math|randint|random|timestamp|type)\\b"
 
-    # HTTP settings
-    - label: "\\b(setheader|setcookie|clearcookies|clearheaders|setcolor|getcolor)\\b"
+    # HTTP/Color/Key settings — orange
+    - symbol: "\\b(setheader|setcookie|clearcookies|clearheaders|setcolor|getcolor|setkey|getkey|listkeys)\\b"
 
     # System commands
-    - symbol: "\\b(exec|env|args|sleep|input|banner)\\b"
+    - preproc.define: "\\b(exec|env|args|sleep|input)\\b"
 
     # Strings — green
     - constant.string: "\"[^\"]*\""
@@ -32,17 +42,20 @@ rules:
     # Numbers — yellow
     - constant.number: "\\b[0-9]+(\\.[0-9]+)?\\b"
 
-    # Comments — gray
+    # Comments — gray/dim
     - comment: "(#.*|//.*)"
 
     # Operators
     - symbol.operator: "(>>|->|==|!=|>=|<=|>|<|\\+|-|\\*|/|%)"
 
-    # Boolean/null — special
+    # Boolean/null
     - type.keyword: "\\b(true|false|null)\\b"
 
-    # Color variables in strings — bright
-    - preproc.define: "\\{[A-Z_]+\\}"
+    # Color variables in strings
+    - preproc: "\\{[A-Z_]+\\}"
 
     # Block delimiters
     - symbol.brackets: "[{}]"
+
+    # Template keywords
+    - type: "\\b(wordlist|filter-status|filter-size|threads)\\b"
